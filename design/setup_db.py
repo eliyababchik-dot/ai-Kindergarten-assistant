@@ -1,56 +1,79 @@
 import sqlite3
 
-# 1. יצירה או חיבור למסד נתונים מקומי בשם substitutes.db
+# 1. התחברות למסד נתונים ויצירת טבלאות
 conn = sqlite3.connect("substitutes.db")
 cursor = conn.cursor()
 
-# 2. יצירת טבלת סייעות
+# טבלת סייעות
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS substitutes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    city TEXT NOT NULL,
-    distance_km REAL,
     experience_years INTEGER
 )
 """)
 
-# 3. הוספת נתוני דוגמה של סייעות (לפי תרחיש 1 שלנו)
-sample_substitutes = [
-    ("שרה כהן", "ירושלים", 1.0, 3),
-    ("לאה גולד", "ירושלים", 5.0, 1),
-    ("רחל אברהם", "ירושלים", 2.0, 5),
-    ("רבקה שוורץ", "ירושלים", 8.0, 2)
-]
+# טבלת מרחקים בין סייעות לגנים שונים (כל סייעת והמרחק שלה לכל גן)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS substitute_distances (
+    substitute_id INTEGER,
+    garden_name TEXT,
+    distance_km REAL,
+    FOREIGN KEY (substitute_id) REFERENCES substitutes (id)
+)
+""")
 
-# מכניסים את הנתונים רק אם הטבלה ריקה כדי לא ליצור כפילויות
+# הנתונים לדוגמה (אם הטבלה ריקה)
 cursor.execute("SELECT COUNT(*) FROM substitutes")
 if cursor.fetchone()[0] == 0:
-    cursor.executemany("""
-    INSERT INTO substitutes (name, city, distance_km, experience_years)
-    VALUES (?, ?, ?, ?)
-    """, sample_substitutes)
+    # הכנסת סייעות
+    cursor.executemany("INSERT INTO substitutes (name, experience_years) VALUES (?, ?)", [
+        ("שרה כהן", 3),
+        ("לאה גולד", 1),
+        ("רחל אברהם", 5)
+    ])
+    
+    # הגדרת מרחקים שונים לכל סייעת לכל גן!
+    # סייעת 1 (שרה) קרובה לגן שקד אבל רחוקה מגן רימון
+    # סייעת 2 (לאה) בינונית בשניהם
+    # סייעת 3 (רחל) רחוקה מגן שקד אבל קרובה מאוד לגן רימון
+    distances_data = [
+        (1, "גן שקד", 1.0), (1, "גן רימון", 8.0),
+        (2, "גן שקד", 4.0), (2, "גן רימון", 4.5),
+        (3, "גן שקד", 7.0), (3, "גן רימון", 1.5)
+    ]
+    cursor.executemany("INSERT INTO substitute_distances (substitute_id, garden_name, distance_km) VALUES (?, ?, ?)", distances_data)
     conn.commit()
 
-print("מסד הנתונים הוקם ונתוני הדוגמה הוזנו בהצלחה!\n")
+# ==========================================
+# 2. הרכזת מדווחת על היעדרות בגן ספציפי!
+# ==========================================
+target_garden = "גן רימון"  # נסי להחליף ל- "גן שקד" ותראי איך הדירוג משתנה!
+print(label := f"--- תוצאות דירוג הסייעות עבור דיווח היעדרות ב-{target_garden} ---")
 
-# 4. הדמיה של שליפה וחישוב יוריסטיקה (דירוג משוקלל)
-# נניח שחיפשנו סייעות לגן מסוים, ונרצה למיין לפי נוסחה: ככל שהמרחק קטן יותר והניסיון רב יותר - הציון גבוה יותר.
-print("--- תוצאות דירוג הסייעות עבור הקריאה ---")
-cursor.execute("SELECT name, distance_km, experience_years FROM substitutes")
-substitutes = cursor.fetchall()
+# 3. שליפת הסייעות והמרחק שלהן *אך ורק* ביחס לגן הנבחר
+query = """
+SELECT s.name, s.experience_years, d.distance_km 
+FROM substitutes s
+JOIN substitute_distances d ON s.id = d.substitute_id
+WHERE d.garden_name = ?
+"""
 
+cursor.execute(query, (target_garden,))
+substitutes_at_garden = cursor.fetchall()
+
+# 4. חישוב יוריסטיקה דינמית (ניסיון כפול 10 פחות המרחק מהגן הספציפי הזה)
 scored_substitutes = []
-for sub in substitutes:
-    name, distance, experience = sub
-    # נוסחה פשוטה ליוריסטיקה: ניסיון כפול 10 פחות מרחק בקילומטרים
+for sub in substitutes_at_garden:
+    name, experience, distance = sub
     score = (experience * 10) - (distance * 2)
     scored_substitutes.append((name, score, distance, experience))
 
 # מיון מהציון הגבוה לנמוך
 scored_substitutes.sort(key=lambda x: x[1], reverse=True)
 
+# הצגת התוצאות לרכזת
 for i, sub in enumerate(scored_substitutes, 1):
-    print(f"{i}. {sub[0]} | ציון התאמה: {sub[1]} (מרחק: {sub[2]}ק\"מ, ניסיון: {sub[3]} שנים)")
+    print(f"{i}. {sub[0]} | ציון התאמה: {sub[1]} (מרחק מ{target_garden}: {sub[2]}ק\"מ, ניסיון: {sub[3]} שנים)")
 
 conn.close()

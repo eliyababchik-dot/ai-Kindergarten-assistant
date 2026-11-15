@@ -1,0 +1,136 @@
+"""Domain models and data transfer objects for the Kindergarten Staff Scheduling Assistant.
+
+This module defines the core data contracts shared across modules. It includes
+all data structures needed for Scenario 1 (filtering and ranking candidates),
+while also defining the extensible fields required for future MVP phases
+(such as candidate phone numbers for WhatsApp messaging, absence lifecycle
+statuses for assignment closure, and dynamic constraint models for re-ranking).
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+
+@dataclass
+class Substitute:
+    """Represents a kindergarten assistant / substitute staff member.
+
+    Attributes:
+        id: Unique database identifier for the substitute (None if not yet persisted).
+        name: Full name of the substitute assistant.
+        experience_years: Total years of early childhood care experience.
+        phone_number: Contact telephone number (used for WhatsApp outreach in MVP).
+    """
+
+    id: Optional[int] = None
+    name: str = ""
+    experience_years: int = 0
+    phone_number: str = ""
+
+
+@dataclass
+class GardenDistance:
+    """Represents the pre-calculated travel distance from a substitute to a kindergarten.
+
+    Attributes:
+        substitute_id: Database identifier of the substitute assistant.
+        garden_name: Name of the kindergarten.
+        distance_km: Geographic or commute distance in kilometers.
+    """
+
+    substitute_id: int
+    garden_name: str
+    distance_km: float
+
+
+@dataclass
+class AbsenceRequest:
+    """Represents a coordinator's report of a sudden staff absence at a kindergarten.
+
+    Attributes:
+        garden_name: Name of the kindergarten experiencing a staffing shortage.
+        date: Date of the absence (formatted as YYYY-MM-DD).
+        start_time: Shift start time (formatted as HH:MM).
+        end_time: Shift end time (formatted as HH:MM).
+        absence_id: Unique database identifier for this request (None if new).
+        status: Current lifecycle status ('OPEN', 'IN_PROGRESS', 'FILLED', 'CANCELLED').
+        assigned_substitute_id: Identifier of the assigned substitute once confirmed.
+        requirements: Special tags or mandatory qualifications required for the shift.
+    """
+
+    garden_name: str
+    date: str
+    start_time: str
+    end_time: str
+    absence_id: Optional[int] = None
+    status: str = "OPEN"
+    assigned_substitute_id: Optional[int] = None
+    requirements: List[str] = field(default_factory=list)
+
+
+@dataclass
+class CandidateMatch:
+    """Represents a substitute eligible for an absence, populated with garden metrics.
+
+    Attributes:
+        substitute_id: Database identifier of the candidate.
+        name: Full name of the candidate.
+        experience_years: Total years of childcare experience.
+        distance_km: Commute distance in kilometers to the target kindergarten.
+        phone_number: Contact phone number for communication.
+    """
+
+    substitute_id: int
+    name: str
+    experience_years: int
+    distance_km: float
+    phone_number: str = ""
+
+
+@dataclass
+class ScoringWeights:
+    """Heuristic scoring parameters used to evaluate candidate suitability.
+
+    Attributes:
+        experience_weight: Multiplier applied per year of assistant experience.
+        distance_penalty_weight: Penalty subtracted per kilometer of commute distance.
+        delay_penalty_per_minute: Penalty subtracted per minute of late arrival (for dynamic re-ranking).
+    """
+
+    experience_weight: float = 10.0
+    distance_penalty_weight: float = 2.0
+    delay_penalty_per_minute: float = 0.5
+
+
+@dataclass
+class CandidateConstraint:
+    """Constraints and availability feedback extracted from candidate conversations.
+
+    Attributes:
+        substitute_id: Database identifier of the candidate reporting constraints.
+        delay_minutes: Number of minutes the candidate will arrive after shift start.
+        is_available: Boolean flag indicating overall willingness to take the shift.
+        notes: Additional qualitative constraints extracted from candidate dialogue.
+    """
+
+    substitute_id: int
+    delay_minutes: int = 0
+    is_available: bool = True
+    notes: str = ""
+
+
+@dataclass
+class RankedCandidate:
+    """A scored substitute candidate sorted for presentation or placement.
+
+    Attributes:
+        candidate: CandidateMatch record containing substitute profile and distance.
+        score: Computed heuristic score (higher score indicates better match).
+        rank: Relative position in the sorted recommendation list (1 = top match).
+        breakdown: Granular scoring components explaining the total score.
+    """
+
+    candidate: CandidateMatch
+    score: float
+    rank: int
+    breakdown: Dict[str, float] = field(default_factory=dict)
