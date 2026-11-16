@@ -13,10 +13,17 @@ MVP Context:
 """
 
 from typing import List, Optional
-from source.data_ingestion import DataIngestionService
-from source.database import DatabaseGateway
-from source.models import AbsenceRequest, RankedCandidate
-from source.ranking_engine import HeuristicRankingEngine
+
+try:
+    from source.data_ingestion import DataIngestionService
+    from source.database import DatabaseGateway
+    from source.models import AbsenceRequest, RankedCandidate
+    from source.ranking_engine import HeuristicRankingEngine
+except ImportError:
+    from .data_ingestion import DataIngestionService
+    from .database import DatabaseGateway
+    from .models import AbsenceRequest, RankedCandidate
+    from .ranking_engine import HeuristicRankingEngine
 
 
 class AbsenceOrchestrator:
@@ -24,8 +31,8 @@ class AbsenceOrchestrator:
 
     def __init__(
         self,
-        db_gateway: DatabaseGateway,
-        ranking_engine: HeuristicRankingEngine,
+        db_gateway: Optional[DatabaseGateway] = None,
+        ranking_engine: Optional[HeuristicRankingEngine] = None,
         ingestion_service: Optional[DataIngestionService] = None,
     ) -> None:
         """Initialize the orchestrator with required domain dependencies.
@@ -35,18 +42,24 @@ class AbsenceOrchestrator:
             ranking_engine: HeuristicRankingEngine for scoring candidate matches.
             ingestion_service: Optional service for pre-prepared file bootstrapping.
         """
-        pass
+        self.db_gateway = db_gateway or DatabaseGateway()
+        self.ranking_engine = ranking_engine or HeuristicRankingEngine()
+        self.ingestion_service = ingestion_service or DataIngestionService(self.db_gateway)
 
     def bootstrap_system(
-        self, substitutes_file: str, distances_file: str
+        self, substitutes_file: str = "", distances_file: str = ""
     ) -> None:
         """Initialize the database schema and seed initial pre-prepared data.
 
         Args:
-            substitutes_file: Path to pre-prepared assistant profiles dataset.
-            distances_file: Path to pre-prepared kindergarten distances dataset.
+            substitutes_file: Optional path to pre-prepared assistant profiles dataset.
+            distances_file: Optional path to pre-prepared kindergarten distances dataset.
         """
-        pass
+        self.db_gateway.initialize_schema()
+        if substitutes_file and distances_file:
+            self.ingestion_service.seed_database(substitutes_file, distances_file)
+        else:
+            self.ingestion_service.seed_default_data()
 
     def handle_absence_report(
         self, request: AbsenceRequest
@@ -65,4 +78,18 @@ class AbsenceOrchestrator:
         Returns:
             A list of RankedCandidate objects sorted by descending heuristic score.
         """
-        pass
+        # Ensure default data is seeded if database is fresh
+        self.ingestion_service.seed_default_data()
+
+        # 1. Record the absence request in storage
+        self.db_gateway.create_absence(request)
+
+        # 2. Query available candidate substitutes for the target garden and date
+        candidates = self.db_gateway.get_candidates_for_garden(
+            request.garden_name, request.date
+        )
+
+        # 3. Compute heuristic scores and order by suitability
+        ranked_candidates = self.ranking_engine.rank_candidates(candidates, request)
+
+        return ranked_candidates

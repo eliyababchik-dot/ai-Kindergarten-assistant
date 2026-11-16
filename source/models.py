@@ -95,11 +95,13 @@ class ScoringWeights:
         experience_weight: Multiplier applied per year of assistant experience.
         distance_penalty_weight: Penalty subtracted per kilometer of commute distance.
         delay_penalty_per_minute: Penalty subtracted per minute of late arrival (for dynamic re-ranking).
+        base_score: Optional baseline score offset.
     """
 
     experience_weight: float = 10.0
     distance_penalty_weight: float = 2.0
     delay_penalty_per_minute: float = 0.5
+    base_score: float = 0.0
 
 
 @dataclass
@@ -134,3 +136,39 @@ class RankedCandidate:
     score: float
     rank: int
     breakdown: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class DialogueContext:
+    """Context information for managing arrival confirmation dialogue.
+
+    Attributes:
+        candidate_name: Full name of the candidate being contacted.
+        garden_name: Name of the kindergarten with the absence.
+        shift_date: Date of the shift (YYYY-MM-DD).
+        shift_hours: Expected shift hours (e.g., '08:00-14:00').
+        candidate_phone: Contact telephone number.
+        chat_history: List of conversation messages exchanged so far.
+    """
+
+    candidate_name: str
+    garden_name: str
+    shift_date: str
+    shift_hours: str
+    candidate_phone: str = ""
+    chat_history: List[Dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class ExtractedConstraints:
+    """Structured availability status and constraints extracted from dialogue.
+
+    Attributes:
+        willingness: Confirmation status ('CONFIRMED', 'DECLINED', 'CONDITIONAL').
+        arrival_time: Explicit arrival time if candidate stated a constraint (e.g. '08:30'), or None.
+        notes: Summary commentary or explanation from the dialogue.
+    """
+
+    willingness: str = "CONFIRMED"
+    arrival_time: Optional[str] = None
+    notes: str = "Stub confirmation"
