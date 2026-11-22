@@ -1,9 +1,11 @@
-"""Unit tests for dialogue_agent and logprobs confidence scoring."""
+"""Unit tests for dialogue_agent, logprobs confidence scoring, and context engineering."""
 
+import json
 import math
 import unittest
 from types import SimpleNamespace
-from typing import Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
 
 from source.models import (
     CandidateMatch,
@@ -195,6 +197,147 @@ class TestDialogueAgent(unittest.TestCase):
 
         reply_res = agent.process_reply(self.context, "אגיע")
         self.assertEqual(reply_res.willingness, "CONFIRMED")
+
+    @patch("source.dialogue_agent._get_llm_client")
+    def test_context_engineering_outreach_message(self, mock_get_client):
+        """Verify generate_outreach_message applies role separation, one-shot example, and JSON input."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="היי חן, התפנה שיבוץ בגן שקד. נשמח לעזרתך!"
+                )
+            )
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mock_get_client.return_value = mock_client
+
+        result = generate_outreach_message(
+            candidate=self.candidate,
+            garden_name="Gan Shaked",
+            shift_date="2026-11-22",
+            shift_hours="08:00-14:00",
+            stub_mode=False,
+        )
+
+        mock_client.chat.completions.create.assert_called_once()
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+
+        self.assertEqual(call_kwargs["temperature"], 0.7)
+        self.assertEqual(call_kwargs["max_tokens"], 150)
+
+        messages = call_kwargs["messages"]
+        self.assertEqual(len(messages), 4)
+
+        # 1. System message
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("וואטסאפ", messages[0]["content"])
+        self.assertIn("אל תמציא", messages[0]["content"])
+
+        # 2. One-shot user example
+        self.assertEqual(messages[1]["role"], "user")
+        example_input = json.loads(messages[1]["content"])
+        self.assertEqual(example_input["candidate_name"], "מיכל לוי")
+
+        # 3. One-shot assistant example
+        self.assertEqual(messages[2]["role"], "assistant")
+        self.assertIn("מיכל", messages[2]["content"])
+
+        # 4. Final user input with structured JSON and /no_think
+        self.assertEqual(messages[3]["role"], "user")
+        self.assertTrue(messages[3]["content"].endswith("/no_think"))
+        json_payload = messages[3]["content"].replace("/no_think", "").strip()
+        parsed_input = json.loads(json_payload)
+        self.assertEqual(parsed_input["candidate_name"], "חן כהן")
+        self.assertEqual(parsed_input["garden_name"], "Gan Shaked")
+        self.assertEqual(parsed_input["shift_date"], "2026-11-22")
+        self.assertEqual(parsed_input["shift_hours"], "08:00-14:00")
+
+        self.assertEqual(result, "היי חן, התפנה שיבוץ בגן שקד. נשמח לעזרתך!")
+
+    @patch("source.dialogue_agent._get_llm_client")
+    def test_context_engineering_confirm_arrival(self, mock_get_client):
+        """Verify confirm_arrival_dialogue applies role separation, anti-alignment bias, few-shots, and JSON input."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="STATUS: CONDITIONAL\nARRIVAL: 08:30\nNOTES: תגיע ב-08:30"
+                ),
+                logprobs=None,
+            )
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mock_get_client.return_value = mock_client
+
+        candidate_reply = "אולי אצליח להגיע ב-08:30 אם אמצא סידור לילד"
+        result = confirm_arrival_dialogue(
+            context=self.context,
+            candidate_reply=candidate_reply,
+            stub_mode=False,
+        )
+
+        mock_client.chat.completions.create.assert_called_once()
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+
+        self.assertEqual(call_kwargs["temperature"], 0.0)
+        self.assertEqual(call_kwargs["seed"], 42)
+        self.assertEqual(call_kwargs["max_tokens"], 80)
+        self.assertTrue(call_kwargs["logprobs"])
+        self.assertEqual(call_kwargs["top_logprobs"], 3)
+
+        messages = call_kwargs["messages"]
+        # System + 3 few-shot pairs (6 messages) + 1 runtime user message = 8 messages
+        self.assertEqual(len(messages), 8)
+
+        # 1. System message checks
+        self.assertEqual(messages[0]["role"], "system")
+        system_content = messages[0]["content"]
+        expected_negative_constraint = (
+            "Under no circumstances classify a reply as CONFIRMED if the candidate mentions arriving late, "
+            "leaving early, or any condition/uncertainty (such as 'if', 'maybe', 'only at...'). "
+            "Even if the candidate sounds enthusiastic, any time constraint or condition MUST be classified as CONDITIONAL."
+        )
+        self.assertIn(expected_negative_constraint, system_content)
+        self.assertIn("עד 10 מילים", system_content)
+
+        # 2. Few-shot pairs check
+        # Pair 1: Clear confirmation
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("בטח, מגיעה ב-08:00 בדיוק", messages[1]["content"])
+        self.assertEqual(messages[2]["role"], "assistant")
+        self.assertIn("STATUS: CONFIRMED", messages[2]["content"])
+        self.assertIn("ARRIVAL: NONE", messages[2]["content"])
+
+        # Pair 2: Enthusiastic reply with late arrival
+        self.assertEqual(messages[3]["role"], "user")
+        self.assertIn("אשמח להגיע, רק אוכל להגיע ב-08:30", messages[3]["content"])
+        self.assertEqual(messages[4]["role"], "assistant")
+        self.assertIn("STATUS: CONDITIONAL", messages[4]["content"])
+        self.assertIn("ARRIVAL: 08:30", messages[4]["content"])
+
+        # Pair 3: Clear decline
+        self.assertEqual(messages[5]["role"], "user")
+        self.assertIn("סליחה, אני חולה היום ולא אוכל להגיע", messages[5]["content"])
+        self.assertEqual(messages[6]["role"], "assistant")
+        self.assertIn("STATUS: DECLINED", messages[6]["content"])
+        self.assertIn("ARRIVAL: NONE", messages[6]["content"])
+
+        # 3. Final runtime user prompt check
+        self.assertEqual(messages[7]["role"], "user")
+        self.assertTrue(messages[7]["content"].endswith("/no_think"))
+        json_payload = messages[7]["content"].replace("/no_think", "").strip()
+        runtime_data = json.loads(json_payload)
+        self.assertEqual(runtime_data["candidate_name"], "חן כהן")
+        self.assertEqual(runtime_data["garden_name"], "Gan Shaked")
+        self.assertEqual(runtime_data["shift_date"], "2026-11-22")
+        self.assertEqual(runtime_data["shift_hours"], "08:00-14:00")
+        self.assertEqual(runtime_data["candidate_reply"], candidate_reply)
+
+        self.assertEqual(result.willingness, "CONDITIONAL")
+        self.assertEqual(result.arrival_time, "08:30")
 
 
 if __name__ == "__main__":

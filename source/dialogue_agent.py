@@ -3,14 +3,17 @@
 Manages arrival confirmation conversations with substitute candidates over WhatsApp,
 generates personalized outreach messages, and extracts schedule constraints using
 the standard Chat Completions API (configured for local Ollama or OpenAI).
+Applies Context Engineering best practices: role separation, structured JSON inputs,
+unambiguous constraints, anti-alignment bias guards, and token-efficient few-shot examples.
 """
 
+import json
 import math
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -89,6 +92,7 @@ def _find_status_token_item(choice: Any) -> Optional[Any]:
 
         if "STATUS" in token_upper:
             seen_status_keyword = True
+            # Case where token contains both header and value (e.g. "STATUS: CONFIRMED")
             for status in status_values:
                 if status in token_upper:
                     return item
@@ -189,27 +193,55 @@ def generate_outreach_message(
             f"בתאריך {shift_date} ({shift_hours}). האם תוכלי להגיע?"
         )
 
-    certs_text = ", ".join(candidate.certifications) if candidate.certifications else "ללא תעודות מיוחדות"
-    prompt = (
-        f"כתוב הודעת וואטסאפ קצרה, חמה ומקצועית בעברית לסייעת מחליפה.\n"
-        f"פרטי הסייעת: {candidate.first_name} {candidate.last_name}, "
-        f"ניסיון: {candidate.experience_years} שנים, הכשרות: {certs_text}, "
-        f"מרחק מהגן: {candidate.distance_km} ק\"מ.\n"
-        f"פרטי השיבוץ: גן '{garden_name}', תאריך {shift_date}, שעות {shift_hours}.\n"
-        f"בקש ממנה לאשר אם היא פנויה להגיע או לעדכן אם יש לה אילוץ שעות. "
-        f"החזר רק את נוסח ההודעה עצמה ללא הקדמות.\n"
-        f"/no_think"
+    system_prompt = (
+        "אתה עוזר גיוס ושיבוץ של רשת גני ילדים.\n"
+        "תפקידך לכתוב הודעת וואטסאפ קצרה, חמה ומקצועית בעברית לסייעת מחליפה מובילה עבור שיבוץ פנוי.\n"
+        "כללים והנחיות:\n"
+        "- פנה לסייעת בשמה הפרטי.\n"
+        "- ציין את שם הגן, תאריך המשמרת ושעות המשמרת במדויק מתוך נתוני הקלט.\n"
+        "- בקש ממנה לאשר הגעה או לעדכן אם יש לה אילוץ שעות.\n"
+        "- שמור על נוסח תמציתי ומזמין (עד 3-4 משפטים, מותאם למגבלת 150 טוקנים).\n"
+        "- הנחיה שלילית: אל תמציא פרטי משמרת, שכר או מידע שלא סופק בקלט.\n"
+        "- פלוט אך ורק את נוסח הודעת הוואטסאפ עצמה, ללא הקדמות, מרכאות או פניות מערכת."
     )
+
+    one_shot_input = {
+        "candidate_name": "מיכל לוי",
+        "experience_years": 4,
+        "certifications": ["עזרה ראשונה"],
+        "distance_km": 1.8,
+        "garden_name": "גן תמר",
+        "shift_date": "2026-11-23",
+        "shift_hours": "08:00-14:00",
+    }
+    one_shot_output = (
+        "היי מיכל, מה שלומך? התפנה לנו שיבוץ בגן תמר בתאריך 2026-11-23 בין השעות 08:00-14:00. "
+        "נשמח מאוד אם תוכלי להגיע להחליף! האם את פנויה, או שיש לך אילוץ שעות כלשהו? תודה ויום מקסים!"
+    )
+
+    runtime_input = {
+        "candidate_name": f"{candidate.first_name} {candidate.last_name}",
+        "experience_years": candidate.experience_years,
+        "certifications": candidate.certifications if candidate.certifications else [],
+        "distance_km": candidate.distance_km,
+        "garden_name": garden_name,
+        "shift_date": shift_date,
+        "shift_hours": shift_hours,
+    }
+
+    final_user_content = json.dumps(runtime_input, ensure_ascii=False) + "\n/no_think"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(one_shot_input, ensure_ascii=False)},
+        {"role": "assistant", "content": one_shot_output},
+        {"role": "user", "content": final_user_content},
+    ]
 
     client = _get_llm_client()
     response = client.chat.completions.create(
         model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        messages=messages,
         temperature=0.7,
         max_tokens=150,
     )
@@ -231,27 +263,89 @@ def confirm_arrival_dialogue(
             top_alternatives=None,
         )
 
-    prompt = (
-        f"אתה עוזר לרכזת גני ילדים לנתח תשובת וואטסאפ מסייעת מחליפה.\n"
-        f"שם הסייעת: {context.candidate_name}\n"
-        f"גן: {context.garden_name} | תאריך: {context.shift_date} | שעות משמרת: {context.shift_hours}\n"
-        f"תשובת הסייעת: \"{candidate_reply}\"\n\n"
-        f"נתח את התשובה והחזר תשובה בפורמט המדויק הבא (3 שורות בלבד):\n"
-        f"STATUS: CONFIRMED או DECLINED או CONDITIONAL\n"
-        f"ARRIVAL: שעת הגעה בפורמט HH:MM אם ציינה איחור/הגעה חלקית, אחרת NONE\n"
-        f"NOTES: סיכום קצר בעברית של תשובת הסייעת\n"
-        f"/no_think"
+    system_prompt = (
+        "אתה עוזר לרכזת גני ילדים לניתוח תשובות וואטסאפ של סייעות מחליפות וחילוץ אילוצי שיבוץ.\n"
+        "עליך לנתח את תוכן ההודעה ששלחה הסייעת ולהחזיר פלט מובנה בפורמט המדויק הבא (3 שורות בלבד, ללא שום תוספת):\n"
+        "STATUS: CONFIRMED או DECLINED או CONDITIONAL\n"
+        "ARRIVAL: שעת הגעה בפורמט HH:MM אם ציינה איחור/הגעה חלקית, אחרת NONE\n"
+        "NOTES: משפט קצר ותמציתי בעברית של עד 10 מילים המסכם את תשובת הסייעת\n\n"
+        "כללי סיווג:\n"
+        "- CONFIRMED: אישור הגעה מלא בזמן מתחילת המשמרת ללא שום תנאי או הסתייגות.\n"
+        "- DECLINED: סירוב מפורש להגיע למשמרת (למשל מחלה, חוסר פניות, סירוב).\n"
+        "- CONDITIONAL: כל מקרה של הגעה מאוחרת, הגעה חלקית, או תנאי לקיום המשמרת.\n\n"
+        "הנחיה שלילית קריטית (מניעת הטיית ריצוי / Alignment Bias):\n"
+        "Under no circumstances classify a reply as CONFIRMED if the candidate mentions arriving late, "
+        "leaving early, or any condition/uncertainty (such as 'if', 'maybe', 'only at...'). "
+        "Even if the candidate sounds enthusiastic, any time constraint or condition MUST be classified as CONDITIONAL."
     )
+
+    # Few-shot 1: Clear confirmation
+    ex1_input = {
+        "candidate_name": "שרה לוי",
+        "garden_name": "גן שקד",
+        "shift_date": "2026-11-22",
+        "shift_hours": "08:00-14:00",
+        "candidate_reply": "בטח, מגיעה ב-08:00 בדיוק",
+    }
+    ex1_output = (
+        "STATUS: CONFIRMED\n"
+        "ARRIVAL: NONE\n"
+        "NOTES: הסייעת אישרה הגעה בזמן"
+    )
+
+    # Few-shot 2: Enthusiastic reply with late arrival
+    ex2_input = {
+        "candidate_name": "רחל כהן",
+        "garden_name": "גן שקד",
+        "shift_date": "2026-11-22",
+        "shift_hours": "08:00-14:00",
+        "candidate_reply": "אשמח להגיע, רק אוכל להגיע ב-08:30",
+    }
+    ex2_output = (
+        "STATUS: CONDITIONAL\n"
+        "ARRIVAL: 08:30\n"
+        "NOTES: הסייעת תשמח להגיע אך באיחור ל-08:30"
+    )
+
+    # Few-shot 3: Clear decline
+    ex3_input = {
+        "candidate_name": "נועה ישראלי",
+        "garden_name": "גן שקד",
+        "shift_date": "2026-11-22",
+        "shift_hours": "08:00-14:00",
+        "candidate_reply": "סליחה, אני חולה היום ולא אוכל להגיע",
+    }
+    ex3_output = (
+        "STATUS: DECLINED\n"
+        "ARRIVAL: NONE\n"
+        "NOTES: הסייעת חולה ולא תוכל להגיע למשמרת"
+    )
+
+    runtime_input = {
+        "candidate_name": context.candidate_name,
+        "garden_name": context.garden_name,
+        "shift_date": context.shift_date,
+        "shift_hours": context.shift_hours,
+        "candidate_reply": candidate_reply,
+    }
+
+    final_user_content = json.dumps(runtime_input, ensure_ascii=False) + "\n/no_think"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(ex1_input, ensure_ascii=False)},
+        {"role": "assistant", "content": ex1_output},
+        {"role": "user", "content": json.dumps(ex2_input, ensure_ascii=False)},
+        {"role": "assistant", "content": ex2_output},
+        {"role": "user", "content": json.dumps(ex3_input, ensure_ascii=False)},
+        {"role": "assistant", "content": ex3_output},
+        {"role": "user", "content": final_user_content},
+    ]
 
     client = _get_llm_client()
     response = client.chat.completions.create(
         model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        messages=messages,
         temperature=0.0,
         seed=42,
         max_tokens=80,
