@@ -17,15 +17,27 @@ class Substitute:
 
     Attributes:
         id: Unique database identifier for the substitute (None if not yet persisted).
-        name: Full name of the substitute assistant.
+        first_name: First name of the substitute assistant.
+        last_name: Last name of the substitute assistant.
+        city: City of residence.
+        neighborhood: Neighborhood of residence.
+        age: Age of the substitute assistant.
         experience_years: Total years of early childhood care experience.
+        certifications: List of certifications and courses (e.g., First Aid, Special Ed).
         phone_number: Contact telephone number (used for WhatsApp outreach in MVP).
+        available_days: List of days the substitute is generally available to work.
     """
 
+    first_name: str
+    last_name: str
+    city: str
+    neighborhood: str
+    age: int
+    experience_years: int
+    certifications: List[str]
+    phone_number: str
+    available_days: List[str]
     id: Optional[int] = None
-    name: str = ""
-    experience_years: int = 0
-    phone_number: str = ""
 
 
 @dataclass
@@ -74,15 +86,23 @@ class CandidateMatch:
 
     Attributes:
         substitute_id: Database identifier of the candidate.
-        name: Full name of the candidate.
+        first_name: First name of the candidate.
+        last_name: Last name of the candidate.
+        city: City of residence.
+        neighborhood: Neighborhood of residence.
         experience_years: Total years of childcare experience.
+        certifications: List of relevant certifications.
         distance_km: Commute distance in kilometers to the target kindergarten.
         phone_number: Contact phone number for communication.
     """
 
     substitute_id: int
-    name: str
+    first_name: str
+    last_name: str
+    city: str
+    neighborhood: str
     experience_years: int
+    certifications: List[str]
     distance_km: float
     phone_number: str = ""
 

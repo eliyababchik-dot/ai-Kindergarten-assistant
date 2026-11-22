@@ -2,15 +2,10 @@
 
 This module provides data access and persistence abstraction for SQLite,
 managing table creation, candidate filtering queries, and atomic status updates.
-
-Scenario 1 Role:
-    Executes relational SQL queries joining substitute profiles with distance
-    tables for a specified kindergarten and absence date.
-MVP Context:
-    Fulfills feature 3 ("Initial availability filtering via SQL queries") and
-    feature 5 ("Closing the assignment via SQL UPDATE").
 """
 
+import datetime
+import json
 import sqlite3
 from typing import List, Optional
 
@@ -33,7 +28,6 @@ except ImportError:
 class DatabaseGateway:
     """Gateway for executing SQL operations against the SQLite database."""
 
-    # Garden name aliases to ensure compatibility with English and Hebrew queries
     GARDEN_ALIASES = {
         "gan shaked": ["Gan Shaked", "גן שקד"],
         "גן שקד": ["Gan Shaked", "גן שקד"],
@@ -41,18 +35,22 @@ class DatabaseGateway:
         "גן רימון": ["Gan Rimon", "גן רימון"],
     }
 
-    def __init__(self, db_path: str = "substitutes.db") -> None:
-        """Initialize the database gateway with a target SQLite database file.
+    HEBREW_WEEKDAYS = {
+        6: "ראשון",
+        0: "שני",
+        1: "שלישי",
+        2: "רביעי",
+        3: "חמישי",
+        4: "שישי",
+        5: "שבת",
+    }
 
-        Args:
-            db_path: Path to the SQLite database file (or ':memory:' for tests).
-        """
+    def __init__(self, db_path: str = "substitutes.db") -> None:
         self.db_path = db_path
         self._memory_conn: Optional[sqlite3.Connection] = None
         self.initialize_schema()
 
     def get_connection(self) -> sqlite3.Connection:
-        """Open or return a connection to the SQLite database."""
         if self.db_path == ":memory:":
             if self._memory_conn is None:
                 self._memory_conn = sqlite3.connect(":memory:")
@@ -63,20 +61,24 @@ class DatabaseGateway:
         return conn
 
     def initialize_schema(self) -> None:
-        """Create necessary database tables if they do not already exist."""
         conn = self.get_connection()
         cursor = conn.cursor()
-        # Substitutes table (extended with phone_number for future WhatsApp dialogue)
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS substitutes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            city TEXT,
+            neighborhood TEXT,
+            age INTEGER,
             experience_years INTEGER NOT NULL,
-            phone_number TEXT DEFAULT ''
+            certifications TEXT,
+            phone_number TEXT DEFAULT '',
+            available_days TEXT
         )
         """)
 
-        # Distances between substitutes and specific kindergartens
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS substitute_distances (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +89,6 @@ class DatabaseGateway:
         )
         """)
 
-        # Absence requests table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS absences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +103,6 @@ class DatabaseGateway:
         )
         """)
 
-        # Substitute availability calendar
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS substitute_availability (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,22 +117,31 @@ class DatabaseGateway:
             conn.close()
 
     def save_substitute(self, substitute: Substitute) -> int:
-        """Insert a single substitute assistant record into the database.
-
-        Args:
-            substitute: Substitute model to insert.
-
-        Returns:
-            The generated integer primary key identifier of the inserted record.
-        """
         conn = self.get_connection()
         cursor = conn.cursor()
+
+        certs_json = json.dumps(substitute.certifications, ensure_ascii=False)
+        days_json = json.dumps(substitute.available_days, ensure_ascii=False)
+
         cursor.execute(
             """
-            INSERT INTO substitutes (name, experience_years, phone_number)
-            VALUES (?, ?, ?)
+            INSERT INTO substitutes (
+                first_name, last_name, city, neighborhood, age,
+                experience_years, certifications, phone_number, available_days
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (substitute.name, substitute.experience_years, substitute.phone_number),
+            (
+                substitute.first_name,
+                substitute.last_name,
+                substitute.city,
+                substitute.neighborhood,
+                substitute.age,
+                substitute.experience_years,
+                certs_json,
+                substitute.phone_number,
+                days_json,
+            ),
         )
         sub_id = cursor.lastrowid
         substitute.id = sub_id
@@ -142,11 +151,6 @@ class DatabaseGateway:
         return sub_id
 
     def save_distances(self, distances: List[GardenDistance]) -> None:
-        """Batch insert distance records mapping substitutes to kindergartens.
-
-        Args:
-            distances: Collection of GardenDistance records to insert.
-        """
         records = [
             (dist.substitute_id, dist.garden_name, dist.distance_km)
             for dist in distances
@@ -165,7 +169,6 @@ class DatabaseGateway:
             conn.close()
 
     def set_availability(self, substitute_id: int, date: str, is_available: bool) -> None:
-        """Record availability or absence of a substitute on a given date."""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -180,14 +183,6 @@ class DatabaseGateway:
             conn.close()
 
     def create_absence(self, absence: AbsenceRequest) -> int:
-        """Record a new absence request in the database with status 'OPEN'.
-
-        Args:
-            absence: AbsenceRequest details to record.
-
-        Returns:
-            The generated absence_id for tracking throughout the placement lifecycle.
-        """
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -214,23 +209,21 @@ class DatabaseGateway:
     def get_candidates_for_garden(
         self, garden_name: str, target_date: str
     ) -> List[CandidateMatch]:
-        """Query substitutes with their calculated distance to the specified garden.
-
-        Executes a SQL JOIN between substitutes and substitute_distances, filtering
-        out assistants who already have a confirmed assignment on target_date.
-
-        Args:
-            garden_name: Exact name of the kindergarten with the absence.
-            target_date: Date string (YYYY-MM-DD) to check availability for.
-
-        Returns:
-            A list of eligible CandidateMatch objects with distance and experience metrics.
-        """
         normalized_name = garden_name.strip().lower()
         search_names = self.GARDEN_ALIASES.get(normalized_name, [garden_name])
 
+        target_weekday = None
+        try:
+            parsed_date = datetime.date.fromisoformat(target_date)
+            target_weekday = self.HEBREW_WEEKDAYS[parsed_date.weekday()]
+        except ValueError:
+            target_weekday = None
+
         query = f"""
-        SELECT s.id, s.name, s.experience_years, MIN(d.distance_km) AS distance_km, s.phone_number
+        SELECT
+            s.id, s.first_name, s.last_name, s.city, s.neighborhood,
+            s.experience_years, s.certifications, s.phone_number, s.available_days,
+            MIN(d.distance_km) AS distance_km
         FROM substitutes s
         JOIN substitute_distances d ON s.id = d.substitute_id
         WHERE d.garden_name IN ({','.join(['?'] * len(search_names))})
@@ -251,16 +244,39 @@ class DatabaseGateway:
         cursor.execute(query, params)
         rows = cursor.fetchall()
 
-        results = [
-            CandidateMatch(
-                substitute_id=row["id"],
-                name=row["name"],
-                experience_years=row["experience_years"],
-                distance_km=float(row["distance_km"]),
-                phone_number=row["phone_number"] or "",
+        results = []
+        for row in rows:
+            days = []
+            if row["available_days"]:
+                try:
+                    days = json.loads(row["available_days"])
+                except json.JSONDecodeError:
+                    days = []
+
+            if target_weekday and days and target_weekday not in days:
+                continue
+
+            certs = []
+            if row["certifications"]:
+                try:
+                    certs = json.loads(row["certifications"])
+                except json.JSONDecodeError:
+                    certs = []
+
+            results.append(
+                CandidateMatch(
+                    substitute_id=row["id"],
+                    first_name=row["first_name"],
+                    last_name=row["last_name"],
+                    city=row["city"] or "",
+                    neighborhood=row["neighborhood"] or "",
+                    experience_years=row["experience_years"],
+                    certifications=certs,
+                    distance_km=float(row["distance_km"]),
+                    phone_number=row["phone_number"] or "",
+                )
             )
-            for row in rows
-        ]
+
         if self.db_path != ":memory:":
             conn.close()
         return results
@@ -268,16 +284,6 @@ class DatabaseGateway:
     def update_assignment(
         self, absence_id: int, substitute_id: int, status: str = "FILLED"
     ) -> bool:
-        """Close an absence assignment and lock the substitute schedule via SQL UPDATE.
-
-        Args:
-            absence_id: Identifier of the absence request being resolved.
-            substitute_id: Identifier of the confirmed substitute assistant.
-            status: New terminal status for the absence (defaults to 'FILLED').
-
-        Returns:
-            True if the database record was updated successfully, False otherwise.
-        """
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(

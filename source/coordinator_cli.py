@@ -82,7 +82,7 @@ class CoordinatorCLI:
         for cand in ranked_candidates:
             sub = cand.candidate
             print(
-                f"{cand.rank}. {sub.name} (Score: {cand.score}) | "
+                f"{cand.rank}. {sub.first_name} {sub.last_name} (Score: {cand.score}) | "
                 f"Distance: {sub.distance_km}km, Exp: {sub.experience_years} yrs"
             )
 
