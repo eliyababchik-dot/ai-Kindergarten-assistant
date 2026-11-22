@@ -8,7 +8,7 @@ statuses for assignment closure, and dynamic constraint models for re-ranking).
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -187,8 +187,12 @@ class ExtractedConstraints:
         willingness: Confirmation status ('CONFIRMED', 'DECLINED', 'CONDITIONAL').
         arrival_time: Explicit arrival time if candidate stated a constraint (e.g. '08:30'), or None.
         notes: Summary commentary or explanation from the dialogue.
+        confidence: Linear confidence score (0.0 to 1.0) of the classification status, or None.
+        top_alternatives: Optional list of (token, probability) alternative choices from logprobs.
     """
 
     willingness: str = "CONFIRMED"
     arrival_time: Optional[str] = None
     notes: str = "Stub confirmation"
+    confidence: Optional[float] = None
+    top_alternatives: Optional[List[Tuple[str, float]]] = None
