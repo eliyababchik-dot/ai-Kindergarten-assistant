@@ -1,7 +1,8 @@
-"""Unit tests for dialogue_agent, logprobs confidence scoring, and context engineering."""
+"""Unit tests for dialogue_agent, logprobs confidence scoring, context engineering, and LLM economics."""
 
 import json
 import math
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,14 +18,17 @@ from source.dialogue_agent import (
     _clean_model_output,
     _extract_status_alternatives,
     _extract_status_confidence,
+    _extract_token_usage,
     _parse_llm_constraints,
+    _resolve_classifier_model,
+    _resolve_outreach_model,
     confirm_arrival_dialogue,
     generate_outreach_message,
 )
 
 
 class TestDialogueAgent(unittest.TestCase):
-    """Test suite for dialogue agent LLM parameters, logprobs, and constraints extraction."""
+    """Test suite for dialogue agent LLM parameters, logprobs, constraints extraction, and economics."""
 
     def setUp(self):
         self.candidate = CandidateMatch(
@@ -209,6 +213,11 @@ class TestDialogueAgent(unittest.TestCase):
                 )
             )
         ]
+        mock_response.usage = SimpleNamespace(
+            prompt_tokens=120,
+            completion_tokens=35,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=50),
+        )
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = mock_response
         mock_get_client.return_value = mock_client
@@ -268,6 +277,11 @@ class TestDialogueAgent(unittest.TestCase):
                 logprobs=None,
             )
         ]
+        mock_response.usage = SimpleNamespace(
+            prompt_tokens=85,
+            completion_tokens=22,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=40),
+        )
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = mock_response
         mock_get_client.return_value = mock_client
@@ -338,6 +352,177 @@ class TestDialogueAgent(unittest.TestCase):
 
         self.assertEqual(result.willingness, "CONDITIONAL")
         self.assertEqual(result.arrival_time, "08:30")
+
+    def test_extract_token_usage_full(self):
+        """Test token usage extraction including cached tokens."""
+        mock_resp = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=150,
+                completion_tokens=40,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=50),
+            )
+        )
+        usage = _extract_token_usage(mock_resp)
+        self.assertEqual(usage["prompt_tokens"], 150)
+        self.assertEqual(usage["completion_tokens"], 40)
+        self.assertEqual(usage["cached_tokens"], 50)
+        self.assertEqual(usage["total_tokens"], 190)
+
+    def test_extract_token_usage_none_and_missing_details(self):
+        """Test token usage extraction handles missing usage or details gracefully."""
+        # 1. response is None
+        self.assertEqual(_extract_token_usage(None)["prompt_tokens"], 0)
+
+        # 2. usage is None
+        resp_no_usage = SimpleNamespace(usage=None)
+        self.assertEqual(_extract_token_usage(resp_no_usage)["total_tokens"], 0)
+
+        # 3. prompt_tokens_details is None (typical for local Ollama)
+        resp_ollama = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=25,
+                prompt_tokens_details=None,
+            )
+        )
+        usage = _extract_token_usage(resp_ollama)
+        self.assertEqual(usage["prompt_tokens"], 100)
+        self.assertEqual(usage["completion_tokens"], 25)
+        self.assertEqual(usage["cached_tokens"], 0)
+        self.assertEqual(usage["total_tokens"], 125)
+
+    @patch("source.dialogue_agent._get_llm_client")
+    def test_dialogue_agent_usage_tracking_and_cost(self, mock_get_client):
+        """Verify DialogueAgent tracks cumulative tokens, calls, and calculates estimated cost."""
+        # First call: outreach
+        resp1 = MagicMock()
+        resp1.choices = [SimpleNamespace(message=SimpleNamespace(content="הודעה 1"))]
+        resp1.usage = SimpleNamespace(
+            prompt_tokens=140,
+            completion_tokens=30,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=60),
+        )
+
+        # Second call: classification
+        resp2 = MagicMock()
+        resp2.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="STATUS: CONFIRMED\nARRIVAL: NONE\nNOTES: מגיעה בזמן"
+                ),
+                logprobs=None,
+            )
+        ]
+        resp2.usage = SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=20,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=40),
+        )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [resp1, resp2]
+        mock_get_client.return_value = mock_client
+
+        agent = DialogueAgent(stub_mode=False)
+        self.assertEqual(agent.total_calls, 0)
+        self.assertEqual(agent.estimate_cost_usd(), 0.0)
+
+        # Call 1
+        agent.create_opening_message(self.candidate, "גן שקד", "2026-11-22", "08:00-14:00")
+        self.assertEqual(agent.total_calls, 1)
+        self.assertEqual(agent.total_prompt_tokens, 140)
+        self.assertEqual(agent.total_completion_tokens, 30)
+        self.assertEqual(agent.total_cached_tokens, 60)
+        self.assertEqual(agent.last_call_usage["prompt_tokens"], 140)
+
+        # Call 2
+        agent.process_reply(self.context, "אגיע בזמן")
+        self.assertEqual(agent.total_calls, 2)
+        self.assertEqual(agent.total_prompt_tokens, 240)
+        self.assertEqual(agent.total_completion_tokens, 50)
+        self.assertEqual(agent.total_cached_tokens, 100)
+        self.assertEqual(agent.last_call_usage["prompt_tokens"], 100)
+
+        summary = agent.get_usage_summary()
+        self.assertEqual(summary["total_calls"], 2)
+        self.assertEqual(summary["total_prompt_tokens"], 240)
+        self.assertEqual(summary["total_completion_tokens"], 50)
+        self.assertEqual(summary["total_cached_tokens"], 100)
+        self.assertEqual(summary["total_tokens"], 290)
+
+        # Cost calculation check:
+        # non_cached_prompt = 240 - 100 = 140
+        # input_cost = (140 / 1e6) * 0.15 = 0.000021
+        # cached_cost = (100 / 1e6) * 0.075 = 0.0000075
+        # output_cost = (50 / 1e6) * 0.60 = 0.000030
+        # total_cost = 0.000021 + 0.0000075 + 0.000030 = 0.0000585 -> rounded to 6 places = 0.000058 or 0.000059
+        expected_cost = round(
+            (140 / 1e6) * 0.15 + (100 / 1e6) * 0.075 + (50 / 1e6) * 0.60, 6
+        )
+        self.assertEqual(agent.estimate_cost_usd(), expected_cost)
+
+    def test_dialogue_agent_stub_mode_usage(self):
+        """Verify that stub_mode tracks calls and zero tokens without cost."""
+        agent = DialogueAgent(stub_mode=True)
+        agent.create_opening_message(self.candidate, "גן שקד", "2026-11-22", "08:00-14:00")
+        agent.process_reply(self.context, "אגיע")
+
+        summary = agent.get_usage_summary()
+        self.assertEqual(summary["total_calls"], 2)
+        self.assertEqual(summary["total_prompt_tokens"], 0)
+        self.assertEqual(summary["total_completion_tokens"], 0)
+        self.assertEqual(summary["total_cached_tokens"], 0)
+        self.assertEqual(agent.estimate_cost_usd(), 0.0)
+
+    @patch("source.dialogue_agent._get_llm_client")
+    def test_task_specific_model_tiering(self, mock_get_client):
+        """Verify model tiering environment variables and fallbacks."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(content="STATUS: CONFIRMED\nARRIVAL: NONE\nNOTES: אישור"),
+                logprobs=None,
+            )
+        ]
+        mock_response.usage = None
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mock_get_client.return_value = mock_client
+
+        # 1. Fallback to base model when tiering env vars are not set
+        with patch.dict(os.environ, {"OPENAI_MODEL": "base-model-test"}, clear=False):
+            if "OPENAI_OUTREACH_MODEL" in os.environ:
+                del os.environ["OPENAI_OUTREACH_MODEL"]
+            if "OPENAI_CLASSIFIER_MODEL" in os.environ:
+                del os.environ["OPENAI_CLASSIFIER_MODEL"]
+
+            self.assertEqual(_resolve_outreach_model(), "base-model-test")
+            self.assertEqual(_resolve_classifier_model(), "base-model-test")
+
+            generate_outreach_message(self.candidate, "גן שקד", "2026-11-22", "08:00-14:00")
+            call1_model = mock_client.chat.completions.create.call_args[1]["model"]
+            self.assertEqual(call1_model, "base-model-test")
+
+        # 2. Distinct model tiering for outreach vs classification
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_MODEL": "base-model-test",
+                "OPENAI_OUTREACH_MODEL": "strong-outreach-model",
+                "OPENAI_CLASSIFIER_MODEL": "fast-classifier-model",
+            },
+            clear=False,
+        ):
+            self.assertEqual(_resolve_outreach_model(), "strong-outreach-model")
+            self.assertEqual(_resolve_classifier_model(), "fast-classifier-model")
+
+            generate_outreach_message(self.candidate, "גן שקד", "2026-11-22", "08:00-14:00")
+            call2_model = mock_client.chat.completions.create.call_args[1]["model"]
+            self.assertEqual(call2_model, "strong-outreach-model")
+
+            confirm_arrival_dialogue(self.context, "אגיע בזמן")
+            call3_model = mock_client.chat.completions.create.call_args[1]["model"]
+            self.assertEqual(call3_model, "fast-classifier-model")
 
 
 if __name__ == "__main__":

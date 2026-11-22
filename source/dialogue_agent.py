@@ -5,6 +5,8 @@ generates personalized outreach messages, and extracts schedule constraints usin
 the standard Chat Completions API (configured for local Ollama or OpenAI).
 Applies Context Engineering best practices: role separation, structured JSON inputs,
 unambiguous constraints, anti-alignment bias guards, and token-efficient few-shot examples.
+Includes LLM economics tracking: token usage monitoring, prompt cache accounting,
+and model tiering.
 """
 
 import json
@@ -37,8 +39,26 @@ except (ImportError, ModuleNotFoundError):
 load_dotenv()
 
 MODEL = os.getenv("OPENAI_MODEL", "qwen3:4b")
+OUTREACH_MODEL = os.getenv("OPENAI_OUTREACH_MODEL", MODEL)
+CLASSIFIER_MODEL = os.getenv("OPENAI_CLASSIFIER_MODEL", MODEL)
 BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1/")
 API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
+
+
+def _resolve_outreach_model(override: Optional[str] = None) -> str:
+    """Resolve model for outreach messages with tiering fallback."""
+    if override:
+        return override
+    base_model = os.getenv("OPENAI_MODEL", "qwen3:4b")
+    return os.getenv("OPENAI_OUTREACH_MODEL", base_model)
+
+
+def _resolve_classifier_model(override: Optional[str] = None) -> str:
+    """Resolve model for reply classification with tiering fallback."""
+    if override:
+        return override
+    base_model = os.getenv("OPENAI_MODEL", "qwen3:4b")
+    return os.getenv("OPENAI_CLASSIFIER_MODEL", base_model)
 
 
 def _get_llm_client() -> OpenAI:
@@ -53,6 +73,67 @@ def _clean_model_output(text: str) -> str:
     """Strip optional reasoning blocks (<think>...</think>) returned by local models."""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
+
+
+def _extract_token_usage(response: Any) -> Dict[str, int]:
+    """Safely extract token usage metrics from an LLM completion response.
+
+    Extracts prompt_tokens, completion_tokens, and cached_tokens (if reported
+    via prompt_tokens_details.cached_tokens). Handles missing usage or missing
+    cached token details gracefully for local Ollama and non-OpenAI endpoints.
+
+    Returns:
+        Dict with keys 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens'.
+    """
+    if response is None:
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+
+    if usage is None:
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    prompt_tokens = getattr(usage, "prompt_tokens", 0)
+    if prompt_tokens is None and isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens", 0)
+    prompt_tokens = int(prompt_tokens or 0)
+
+    completion_tokens = getattr(usage, "completion_tokens", 0)
+    if completion_tokens is None and isinstance(usage, dict):
+        completion_tokens = usage.get("completion_tokens", 0)
+    completion_tokens = int(completion_tokens or 0)
+
+    cached_tokens = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None and isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details")
+
+    if details is not None:
+        cached = getattr(details, "cached_tokens", 0)
+        if cached is None and isinstance(details, dict):
+            cached = details.get("cached_tokens", 0)
+        cached_tokens = int(cached or 0)
+
+    total_tokens = prompt_tokens + completion_tokens
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 def _find_status_token_item(choice: Any) -> Optional[Any]:
@@ -185,13 +266,31 @@ def generate_outreach_message(
     shift_date: str,
     shift_hours: str,
     stub_mode: bool = False,
+    model: Optional[str] = None,
+    usage_out: Optional[Dict[str, int]] = None,
 ) -> str:
-    """Generate a personalized WhatsApp outreach message for the top candidate."""
+    """Generate a personalized WhatsApp outreach message for the top candidate.
+
+    Prompt Caching Design:
+        Static persona instructions and one-shot examples are placed at the beginning
+        (the prefix) of the messages list. Only the dynamic runtime JSON payload is placed
+        at the end (the suffix). This maximizes cloud provider prompt caching efficiency
+        and reduces time-to-first-token (TTFT).
+    """
     if stub_mode:
+        if usage_out is not None:
+            usage_out.update({
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+            })
         return (
             f"היי {candidate.first_name}, התפנה שיבוץ ב{garden_name} "
             f"בתאריך {shift_date} ({shift_hours}). האם תוכלי להגיע?"
         )
+
+    target_model = _resolve_outreach_model(model)
 
     system_prompt = (
         "אתה עוזר גיוס ושיבוץ של רשת גני ילדים.\n"
@@ -231,6 +330,7 @@ def generate_outreach_message(
 
     final_user_content = json.dumps(runtime_input, ensure_ascii=False) + "\n/no_think"
 
+    # Invariant prefix (system + one-shot) followed by dynamic suffix for optimal prompt caching
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps(one_shot_input, ensure_ascii=False)},
@@ -240,11 +340,13 @@ def generate_outreach_message(
 
     client = _get_llm_client()
     response = client.chat.completions.create(
-        model=MODEL,
+        model=target_model,
         messages=messages,
         temperature=0.7,
         max_tokens=150,
     )
+    if usage_out is not None:
+        usage_out.update(_extract_token_usage(response))
     return _clean_model_output(response.choices[0].message.content)
 
 
@@ -252,9 +354,25 @@ def confirm_arrival_dialogue(
     context: DialogueContext,
     candidate_reply: str,
     stub_mode: bool = False,
+    model: Optional[str] = None,
+    usage_out: Optional[Dict[str, int]] = None,
 ) -> ExtractedConstraints:
-    """Send candidate reply to the LLM and extract structured schedule constraints."""
+    """Send candidate reply to the LLM and extract structured schedule constraints.
+
+    Prompt Caching Design:
+        Static system instructions, classification rules, negative constraints, and
+        the 3 few-shot examples are placed as the invariant prefix of the message history.
+        Only the dynamic candidate reply JSON payload is sent as the final user message.
+        This allows cloud prompt caches to hit 100% of the instruction/example tokens.
+    """
     if stub_mode:
+        if usage_out is not None:
+            usage_out.update({
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+            })
         return ExtractedConstraints(
             willingness="CONFIRMED",
             arrival_time=None,
@@ -262,6 +380,8 @@ def confirm_arrival_dialogue(
             confidence=None,
             top_alternatives=None,
         )
+
+    target_model = _resolve_classifier_model(model)
 
     system_prompt = (
         "אתה עוזר לרכזת גני ילדים לניתוח תשובות וואטסאפ של סייעות מחליפות וחילוץ אילוצי שיבוץ.\n"
@@ -331,6 +451,7 @@ def confirm_arrival_dialogue(
 
     final_user_content = json.dumps(runtime_input, ensure_ascii=False) + "\n/no_think"
 
+    # Invariant prefix (system + 3 few-shot turns) followed by dynamic user suffix for optimal prompt caching
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps(ex1_input, ensure_ascii=False)},
@@ -344,7 +465,7 @@ def confirm_arrival_dialogue(
 
     client = _get_llm_client()
     response = client.chat.completions.create(
-        model=MODEL,
+        model=target_model,
         messages=messages,
         temperature=0.0,
         seed=42,
@@ -352,6 +473,9 @@ def confirm_arrival_dialogue(
         logprobs=True,
         top_logprobs=3,
     )
+
+    if usage_out is not None:
+        usage_out.update(_extract_token_usage(response))
 
     choice = response.choices[0]
     raw_output = _clean_model_output(choice.message.content)
@@ -403,10 +527,59 @@ def _parse_llm_constraints(
 
 
 class DialogueAgent:
-    """Agent interface for managing conversations with substitutes."""
+    """Agent interface for managing conversations with substitutes and monitoring LLM token economics."""
 
-    def __init__(self, stub_mode: bool = False) -> None:
+    def __init__(
+        self,
+        stub_mode: bool = False,
+        outreach_model: Optional[str] = None,
+        classifier_model: Optional[str] = None,
+    ) -> None:
         self.stub_mode = stub_mode
+        self.outreach_model = outreach_model
+        self.classifier_model = classifier_model
+        self.total_prompt_tokens: int = 0
+        self.total_completion_tokens: int = 0
+        self.total_cached_tokens: int = 0
+        self.total_calls: int = 0
+        self.last_call_usage: Optional[Dict[str, int]] = None
+
+    def _record_call_usage(self, usage: Dict[str, int]) -> None:
+        """Internal helper to aggregate session token usage metrics."""
+        self.total_calls += 1
+        self.total_prompt_tokens += usage.get("prompt_tokens", 0)
+        self.total_completion_tokens += usage.get("completion_tokens", 0)
+        self.total_cached_tokens += usage.get("cached_tokens", 0)
+        self.last_call_usage = usage
+
+    def get_usage_summary(self) -> Dict[str, int]:
+        """Return cumulative token usage and call metrics for the current session."""
+        return {
+            "total_calls": self.total_calls,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_cached_tokens": self.total_cached_tokens,
+            "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
+        }
+
+    def estimate_cost_usd(
+        self,
+        input_price_per_1m: float = 0.15,
+        output_price_per_1m: float = 0.60,
+        cached_input_price_per_1m: float = 0.075,
+    ) -> float:
+        """Compute estimated API cost in USD based on tracked token usage.
+
+        Accounts for non-cached prompt tokens, cached prompt tokens (discounted),
+        and completion tokens according to per-million-tokens pricing.
+        """
+        non_cached_prompt_tokens = max(0, self.total_prompt_tokens - self.total_cached_tokens)
+        cost = (
+            (non_cached_prompt_tokens / 1_000_000.0) * input_price_per_1m
+            + (self.total_cached_tokens / 1_000_000.0) * cached_input_price_per_1m
+            + (self.total_completion_tokens / 1_000_000.0) * output_price_per_1m
+        )
+        return round(cost, 6)
 
     def create_opening_message(
         self,
@@ -415,24 +588,34 @@ class DialogueAgent:
         shift_date: str,
         shift_hours: str,
     ) -> str:
-        """Generate the initial outreach message to a candidate."""
-        return generate_outreach_message(
+        """Generate the initial outreach message to a candidate and track usage."""
+        call_usage: Dict[str, int] = {}
+        msg = generate_outreach_message(
             candidate=candidate,
             garden_name=garden_name,
             shift_date=shift_date,
             shift_hours=shift_hours,
             stub_mode=self.stub_mode,
+            model=self.outreach_model,
+            usage_out=call_usage,
         )
+        self._record_call_usage(call_usage)
+        return msg
 
     def process_reply(
         self, context: DialogueContext, candidate_reply: str
     ) -> ExtractedConstraints:
-        """Process candidate reply and return extracted constraints."""
-        return confirm_arrival_dialogue(
+        """Process candidate reply, extract constraints, and track usage."""
+        call_usage: Dict[str, int] = {}
+        constraints = confirm_arrival_dialogue(
             context=context,
             candidate_reply=candidate_reply,
             stub_mode=self.stub_mode,
+            model=self.classifier_model,
+            usage_out=call_usage,
         )
+        self._record_call_usage(call_usage)
+        return constraints
 
 
 if __name__ == "__main__":
@@ -453,11 +636,12 @@ if __name__ == "__main__":
     shift_hours = "08:00-14:00"
     ambiguous_reply = "אולי אצליח להגיע ב-08:30 אם אמצא סידור לילד"
 
+    agent = DialogueAgent(stub_mode=False)
+
     print("==================================================")
     print("1. יצירת הודעת פתיחה (temperature=0.7, max_tokens=150)")
     print("==================================================")
     try:
-        agent = DialogueAgent(stub_mode=False)
         opening = agent.create_opening_message(
             sample_candidate, garden_name, shift_date, shift_hours
         )
@@ -466,8 +650,8 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[שים לב: שרת ה-LLM המקומי אינו זמין כרגע: {exc}]")
         print("מדגים נוסח במצב stub_mode=True:")
-        stub_agent = DialogueAgent(stub_mode=True)
-        opening = stub_agent.create_opening_message(
+        agent = DialogueAgent(stub_mode=True)
+        opening = agent.create_opening_message(
             sample_candidate, garden_name, shift_date, shift_hours
         )
         print(opening)
@@ -499,8 +683,7 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[שים לב: שרת ה-LLM המקומי אינו זמין כרגע: {exc}]")
         print("מדגים ניתוח במצב stub_mode=True:")
-        stub_agent = DialogueAgent(stub_mode=True)
-        result = stub_agent.process_reply(ctx, ambiguous_reply)
+        result = agent.process_reply(ctx, ambiguous_reply)
         print(result)
 
         print("\n[הדגמת מנגנון חישוב ציון ביטחון (logprobs confidence) ודגל בדיקת רכזת]:")
@@ -527,3 +710,26 @@ if __name__ == "__main__":
         print("  - חלופות טוקנים מובילות:")
         for t_name, t_p in simulated_result.top_alternatives:
             print(f"      * '{t_name}': {t_p:.4f} ({t_p * 100:.2f}%)")
+
+    print("\n==================================================")
+    print("3. מעקב שימוש בטוקנים ועלויות (Token Usage & Economics)")
+    print("==================================================")
+    summary = agent.get_usage_summary()
+    print("סיכום שימוש מצטבר (Usage Summary):")
+    for key, val in summary.items():
+        print(f"  - {key}: {val}")
+
+    estimated_cost = agent.estimate_cost_usd()
+    print(f"\nעלות משוערכת בדולרים (Estimated Cost): ${estimated_cost:.6f}")
+    if agent.last_call_usage:
+        print(f"שימוש בקריאה האחרונה (Last Call Usage): {agent.last_call_usage}")
+
+    if agent.stub_mode:
+        print("\n[הדגמת חישוב עלויות עבור נתוני שימוש לדוגמה עם Prompt Caching]:")
+        sim_agent = DialogueAgent()
+        sim_agent.total_calls = 2
+        sim_agent.total_prompt_tokens = 350
+        sim_agent.total_cached_tokens = 220
+        sim_agent.total_completion_tokens = 65
+        print(f"  - מדדים מדומים: {sim_agent.get_usage_summary()}")
+        print(f"  - עלות משוערכת: ${sim_agent.estimate_cost_usd():.6f}")
