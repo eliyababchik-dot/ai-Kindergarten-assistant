@@ -8,21 +8,27 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
+from pydantic import ValidationError
+
 from source.models import (
     CandidateMatch,
     DialogueContext,
     ExtractedConstraints,
+    ReplyExtractionSchema,
 )
 from source.dialogue_agent import (
     DialogueAgent,
     _clean_model_output,
+    _enforce_deterministic_constraints,
     _extract_status_alternatives,
     _extract_status_confidence,
     _extract_token_usage,
     _parse_llm_constraints,
+    _parse_pydantic_from_raw,
     _resolve_classifier_model,
     _resolve_outreach_model,
     confirm_arrival_dialogue,
+    continue_conversation,
     generate_outreach_message,
 )
 
@@ -267,12 +273,17 @@ class TestDialogueAgent(unittest.TestCase):
 
     @patch("source.dialogue_agent._get_llm_client")
     def test_context_engineering_confirm_arrival(self, mock_get_client):
-        """Verify confirm_arrival_dialogue applies role separation, anti-alignment bias, few-shots, and JSON input."""
+        """Verify confirm_arrival_dialogue uses client.chat.completions.parse with ReplyExtractionSchema."""
         mock_response = MagicMock()
         mock_response.choices = [
             SimpleNamespace(
                 message=SimpleNamespace(
-                    content="STATUS: CONDITIONAL\nARRIVAL: 08:30\nNOTES: תגיע ב-08:30"
+                    parsed=ReplyExtractionSchema(
+                        status="CONDITIONAL",
+                        arrival_time="08:30",
+                        notes="תגיע ב-08:30",
+                    ),
+                    content='{"status": "CONDITIONAL", "arrival_time": "08:30", "notes": "תגיע ב-08:30"}',
                 ),
                 logprobs=None,
             )
@@ -283,7 +294,7 @@ class TestDialogueAgent(unittest.TestCase):
             prompt_tokens_details=SimpleNamespace(cached_tokens=40),
         )
         mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
+        mock_client.chat.completions.parse.return_value = mock_response
         mock_get_client.return_value = mock_client
 
         candidate_reply = "אולי אצליח להגיע ב-08:30 אם אמצא סידור לילד"
@@ -293,9 +304,10 @@ class TestDialogueAgent(unittest.TestCase):
             stub_mode=False,
         )
 
-        mock_client.chat.completions.create.assert_called_once()
-        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        mock_client.chat.completions.parse.assert_called_once()
+        call_kwargs = mock_client.chat.completions.parse.call_args[1]
 
+        self.assertEqual(call_kwargs["response_format"], ReplyExtractionSchema)
         self.assertEqual(call_kwargs["temperature"], 0.0)
         self.assertEqual(call_kwargs["seed"], 42)
         self.assertEqual(call_kwargs["max_tokens"], 80)
@@ -317,27 +329,18 @@ class TestDialogueAgent(unittest.TestCase):
         self.assertIn(expected_negative_constraint, system_content)
         self.assertIn("עד 10 מילים", system_content)
 
-        # 2. Few-shot pairs check
-        # Pair 1: Clear confirmation
-        self.assertEqual(messages[1]["role"], "user")
-        self.assertIn("בטח, מגיעה ב-08:00 בדיוק", messages[1]["content"])
-        self.assertEqual(messages[2]["role"], "assistant")
-        self.assertIn("STATUS: CONFIRMED", messages[2]["content"])
-        self.assertIn("ARRIVAL: NONE", messages[2]["content"])
+        # 2. Few-shot pairs check (assistant replies must match ReplyExtractionSchema JSON)
+        ex1_parsed = ReplyExtractionSchema.model_validate_json(messages[2]["content"])
+        self.assertEqual(ex1_parsed.status, "CONFIRMED")
+        self.assertIsNone(ex1_parsed.arrival_time)
 
-        # Pair 2: Enthusiastic reply with late arrival
-        self.assertEqual(messages[3]["role"], "user")
-        self.assertIn("אשמח להגיע, רק אוכל להגיע ב-08:30", messages[3]["content"])
-        self.assertEqual(messages[4]["role"], "assistant")
-        self.assertIn("STATUS: CONDITIONAL", messages[4]["content"])
-        self.assertIn("ARRIVAL: 08:30", messages[4]["content"])
+        ex2_parsed = ReplyExtractionSchema.model_validate_json(messages[4]["content"])
+        self.assertEqual(ex2_parsed.status, "CONDITIONAL")
+        self.assertEqual(ex2_parsed.arrival_time, "08:30")
 
-        # Pair 3: Clear decline
-        self.assertEqual(messages[5]["role"], "user")
-        self.assertIn("סליחה, אני חולה היום ולא אוכל להגיע", messages[5]["content"])
-        self.assertEqual(messages[6]["role"], "assistant")
-        self.assertIn("STATUS: DECLINED", messages[6]["content"])
-        self.assertIn("ARRIVAL: NONE", messages[6]["content"])
+        ex3_parsed = ReplyExtractionSchema.model_validate_json(messages[6]["content"])
+        self.assertEqual(ex3_parsed.status, "DECLINED")
+        self.assertIsNone(ex3_parsed.arrival_time)
 
         # 3. Final runtime user prompt check
         self.assertEqual(messages[7]["role"], "user")
@@ -403,12 +406,17 @@ class TestDialogueAgent(unittest.TestCase):
             prompt_tokens_details=SimpleNamespace(cached_tokens=60),
         )
 
-        # Second call: classification
+        # Second call: classification via parse
         resp2 = MagicMock()
         resp2.choices = [
             SimpleNamespace(
                 message=SimpleNamespace(
-                    content="STATUS: CONFIRMED\nARRIVAL: NONE\nNOTES: מגיעה בזמן"
+                    parsed=ReplyExtractionSchema(
+                        status="CONFIRMED",
+                        arrival_time=None,
+                        notes="מגיעה בזמן",
+                    ),
+                    content='{"status": "CONFIRMED", "arrival_time": null, "notes": "מגיעה בזמן"}',
                 ),
                 logprobs=None,
             )
@@ -420,7 +428,8 @@ class TestDialogueAgent(unittest.TestCase):
         )
 
         mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = [resp1, resp2]
+        mock_client.chat.completions.create.return_value = resp1
+        mock_client.chat.completions.parse.return_value = resp2
         mock_get_client.return_value = mock_client
 
         agent = DialogueAgent(stub_mode=False)
@@ -455,7 +464,6 @@ class TestDialogueAgent(unittest.TestCase):
         # input_cost = (140 / 1e6) * 0.15 = 0.000021
         # cached_cost = (100 / 1e6) * 0.075 = 0.0000075
         # output_cost = (50 / 1e6) * 0.60 = 0.000030
-        # total_cost = 0.000021 + 0.0000075 + 0.000030 = 0.0000585 -> rounded to 6 places = 0.000058 or 0.000059
         expected_cost = round(
             (140 / 1e6) * 0.15 + (100 / 1e6) * 0.075 + (50 / 1e6) * 0.60, 6
         )
@@ -480,13 +488,17 @@ class TestDialogueAgent(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.choices = [
             SimpleNamespace(
-                message=SimpleNamespace(content="STATUS: CONFIRMED\nARRIVAL: NONE\nNOTES: אישור"),
+                message=SimpleNamespace(
+                    parsed=ReplyExtractionSchema(status="CONFIRMED", arrival_time=None, notes="אישור"),
+                    content='{"status": "CONFIRMED", "arrival_time": null, "notes": "אישור"}',
+                ),
                 logprobs=None,
             )
         ]
         mock_response.usage = None
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = mock_response
+        mock_client.chat.completions.parse.return_value = mock_response
         mock_get_client.return_value = mock_client
 
         # 1. Fallback to base model when tiering env vars are not set
@@ -521,8 +533,202 @@ class TestDialogueAgent(unittest.TestCase):
             self.assertEqual(call2_model, "strong-outreach-model")
 
             confirm_arrival_dialogue(self.context, "אגיע בזמן")
-            call3_model = mock_client.chat.completions.create.call_args[1]["model"]
+            call3_model = mock_client.chat.completions.parse.call_args[1]["model"]
             self.assertEqual(call3_model, "fast-classifier-model")
+
+    def test_pydantic_schema_validation(self):
+        """Verify ReplyExtractionSchema validates allowed categories and rejects invalid ones."""
+        # Allowed statuses
+        for valid_status in ("CONFIRMED", "DECLINED", "CONDITIONAL"):
+            schema = ReplyExtractionSchema(
+                status=valid_status,
+                arrival_time="08:30" if valid_status == "CONDITIONAL" else None,
+                notes="תשובה תקינה",
+            )
+            self.assertEqual(schema.status, valid_status)
+
+        # Invalid status should raise ValidationError
+        with self.assertRaises(ValidationError):
+            ReplyExtractionSchema(
+                status="MAYBE",  # Not in Literal
+                arrival_time=None,
+                notes="אולי אגיע",
+            )
+
+    def test_logprobs_confidence_in_json(self):
+        """Verify _extract_status_confidence and _extract_status_alternatives handle JSON-wrapped tokens."""
+        # Tokens as generated in JSON structured output
+        token_items = [
+            SimpleNamespace(token='{\n  "status": "', logprob=-0.01),
+            SimpleNamespace(
+                token='CONFIRMED',
+                logprob=-0.08,
+                top_logprobs=[
+                    SimpleNamespace(token='"CONFIRMED"', logprob=-0.08),
+                    SimpleNamespace(token='"CONDITIONAL"', logprob=-2.7),
+                    SimpleNamespace(token='"DECLINED"', logprob=-4.5),
+                ],
+            ),
+            SimpleNamespace(token='",\n  "arrival_time": null\n}', logprob=-0.001),
+        ]
+        choice = SimpleNamespace(logprobs=SimpleNamespace(content=token_items))
+
+        conf = _extract_status_confidence(choice)
+        self.assertIsNotNone(conf)
+        self.assertAlmostEqual(conf, round(math.exp(-0.08), 4), places=4)
+
+        alts = _extract_status_alternatives(choice)
+        self.assertEqual(len(alts), 3)
+        self.assertEqual(alts[0][0], "CONFIRMED")
+        self.assertEqual(alts[1][0], "CONDITIONAL")
+        self.assertEqual(alts[2][0], "DECLINED")
+
+    @patch("source.dialogue_agent._get_llm_client")
+    def test_confirm_arrival_fallback_to_create(self, mock_get_client):
+        """Verify graceful fallback to client.chat.completions.create if .parse raises an error."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"status": "CONDITIONAL", "arrival_time": "08:30", "notes": "הסייעת תגיע ב-08:30"}'
+                ),
+                logprobs=None,
+            )
+        ]
+        mock_response.usage = SimpleNamespace(
+            prompt_tokens=90,
+            completion_tokens=25,
+            prompt_tokens_details=None,
+        )
+
+        mock_client = MagicMock()
+        # Simulate local Ollama or unsupported server raising on parse
+        mock_client.chat.completions.parse.side_effect = Exception("Ollama endpoint does not support structured outputs")
+        mock_client.chat.completions.create.return_value = mock_response
+        mock_get_client.return_value = mock_client
+
+        result = confirm_arrival_dialogue(
+            context=self.context,
+            candidate_reply="אגיע ב-08:30",
+            stub_mode=False,
+        )
+
+        # Both parse and create should have been invoked (attempted parse, fell back to create)
+        mock_client.chat.completions.parse.assert_called_once()
+        mock_client.chat.completions.create.assert_called_once()
+
+        self.assertEqual(result.willingness, "CONDITIONAL")
+        self.assertEqual(result.arrival_time, "08:30")
+        self.assertIn("08:30", result.notes)
+
+    def test_enforce_deterministic_constraints_override_confirmed_with_arrival_time(self):
+        """Verify _enforce_deterministic_constraints overrides CONFIRMED + '8:30' into CONDITIONAL + '08:30'."""
+        # Case 1: CONFIRMED with late arrival time "8:30" must be overridden to CONDITIONAL and "08:30"
+        c1 = ExtractedConstraints(
+            willingness="CONFIRMED",
+            arrival_time="8:30",
+            notes="הסייעת אישרה אך מגיעה ב-8:30",
+        )
+        res1 = _enforce_deterministic_constraints(c1)
+        self.assertEqual(res1.willingness, "CONDITIONAL")
+        self.assertEqual(res1.arrival_time, "08:30")
+
+        # Case 2: CONFIRMED with normalized late arrival time "09:15"
+        c2 = ExtractedConstraints(
+            willingness="CONFIRMED",
+            arrival_time="09:15",
+            notes="מגיעה ב-09:15",
+        )
+        res2 = _enforce_deterministic_constraints(c2)
+        self.assertEqual(res2.willingness, "CONDITIONAL")
+        self.assertEqual(res2.arrival_time, "09:15")
+
+        # Case 3: CONFIRMED without arrival_time remains CONFIRMED
+        c3 = ExtractedConstraints(
+            willingness="CONFIRMED",
+            arrival_time=None,
+            notes="אישרה הגעה מלאה",
+        )
+        res3 = _enforce_deterministic_constraints(c3)
+        self.assertEqual(res3.willingness, "CONFIRMED")
+        self.assertIsNone(res3.arrival_time)
+
+    def test_enforce_deterministic_constraints_sanitize_invalid_arrival_time(self):
+        """Verify invalid/out-of-range arrival_time strings are sanitized to None."""
+        invalid_cases = ["NONE", "invalid", "25:00", "08:65", "noon", "8-30", ""]
+        for bad_time in invalid_cases:
+            c = ExtractedConstraints(
+                willingness="CONFIRMED",
+                arrival_time=bad_time,
+                notes="תשובה עם שעה לא תקינה",
+            )
+            res = _enforce_deterministic_constraints(c)
+            self.assertIsNone(
+                res.arrival_time,
+                f"Expected arrival_time to be None for input '{bad_time}'",
+            )
+            # Since arrival_time is None, CONFIRMED is preserved
+            self.assertEqual(res.willingness, "CONFIRMED")
+
+    @patch("source.dialogue_agent._get_llm_client")
+    def test_continue_conversation_grounding_constraint(self, mock_get_client):
+        """Verify continue_conversation injects anti-hallucination grounding constraint in system prompt."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="היי חן, לגבי חניה אבדוק מול הרכזת ואחזור אלייך."
+                )
+            )
+        ]
+        mock_response.usage = SimpleNamespace(
+            prompt_tokens=110,
+            completion_tokens=20,
+            prompt_tokens_details=None,
+        )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mock_get_client.return_value = mock_client
+
+        reply = continue_conversation(
+            context=self.context,
+            candidate_message="יש חניה צמודה לגן?",
+            stub_mode=False,
+        )
+
+        self.assertIn("חניה", reply)
+        mock_client.chat.completions.create.assert_called_once()
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        messages = call_kwargs["messages"]
+
+        system_message = messages[0]
+        self.assertEqual(system_message["role"], "system")
+        system_content = system_message["content"]
+
+        expected_grounding = (
+            "Answer ONLY using facts explicitly provided in the shift context. "
+            "Never invent or guess missing details (such as parking, pay rates, or gate codes). "
+            "If the substitute asks about something not in the context, politely state in Hebrew "
+            "that you will check with the coordinator and get back to her."
+        )
+        self.assertIn(expected_grounding, system_content)
+
+    def test_dialogue_agent_continue_conversation_stub_mode(self):
+        """Verify DialogueAgent.continue_conversation in stub mode operates deterministically and records usage."""
+        agent = DialogueAgent(stub_mode=True)
+        self.assertEqual(agent.total_calls, 0)
+
+        reply = agent.continue_conversation(
+            context=self.context,
+            candidate_message="מה הכתובת המדויקת של הגן?",
+        )
+
+        self.assertIn("חן כהן", reply)
+        self.assertIn("Gan Shaked", reply)
+        self.assertIn("אבדוק עם הרכזת", reply)
+        self.assertEqual(agent.total_calls, 1)
+        self.assertEqual(agent.get_usage_summary()["total_calls"], 1)
 
 
 if __name__ == "__main__":

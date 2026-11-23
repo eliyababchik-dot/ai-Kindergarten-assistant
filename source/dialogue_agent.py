@@ -7,6 +7,7 @@ Applies Context Engineering best practices: role separation, structured JSON inp
 unambiguous constraints, anti-alignment bias guards, and token-efficient few-shot examples.
 Includes LLM economics tracking: token usage monitoring, prompt cache accounting,
 and model tiering.
+Supports Reliable Structured Outputs via Pydantic constrained decoding with graceful local fallbacks.
 """
 
 import json
@@ -29,12 +30,27 @@ if str(_current_dir) not in sys.path:
     sys.path.insert(0, str(_current_dir))
 
 try:
-    from source.models import CandidateMatch, DialogueContext, ExtractedConstraints
+    from source.models import (
+        CandidateMatch,
+        DialogueContext,
+        ExtractedConstraints,
+        ReplyExtractionSchema,
+    )
 except (ImportError, ModuleNotFoundError):
     try:
-        from .models import CandidateMatch, DialogueContext, ExtractedConstraints
+        from .models import (
+            CandidateMatch,
+            DialogueContext,
+            ExtractedConstraints,
+            ReplyExtractionSchema,
+        )
     except (ImportError, ModuleNotFoundError):
-        from models import CandidateMatch, DialogueContext, ExtractedConstraints
+        from models import (
+            CandidateMatch,
+            DialogueContext,
+            ExtractedConstraints,
+            ReplyExtractionSchema,
+        )
 
 load_dotenv()
 
@@ -63,10 +79,16 @@ def _resolve_classifier_model(override: Optional[str] = None) -> str:
 
 def _get_llm_client() -> OpenAI:
     """Initialize and return the OpenAI-compatible Chat Completions client."""
-    return OpenAI(
+    client = OpenAI(
         base_url=BASE_URL,
         api_key=API_KEY,
     )
+    if not hasattr(client.chat.completions, "parse") and hasattr(client, "beta"):
+        try:
+            client.chat.completions.parse = client.beta.chat.completions.parse
+        except Exception:
+            pass
+    return client
 
 
 def _clean_model_output(text: str) -> str:
@@ -140,7 +162,8 @@ def _find_status_token_item(choice: Any) -> Optional[Any]:
     """Find the token logprob entry corresponding to the classification status decision.
 
     Inspects choice.logprobs.content to locate the token representing the status
-    decision (CONFIRMED, DECLINED, or CONDITIONAL).
+    decision (CONFIRMED, DECLINED, or CONDITIONAL), accounting for plain-text (STATUS:)
+    as well as JSON-wrapped ("status": "...") formats.
     """
     if choice is None:
         return None
@@ -160,7 +183,7 @@ def _find_status_token_item(choice: Any) -> Optional[Any]:
     status_values = ("CONFIRMED", "DECLINED", "CONDITIONAL")
     status_prefixes = ("CONF", "DECL", "COND")
 
-    # Pass 1: Scan for the first token after the 'STATUS:' header
+    # Pass 1: Scan for the first token after the 'STATUS' key or header
     seen_status_keyword = False
     for item in content:
         raw_token = getattr(item, "token", None)
@@ -169,26 +192,27 @@ def _find_status_token_item(choice: Any) -> Optional[Any]:
         if not raw_token:
             continue
 
-        token_upper = raw_token.strip().upper()
+        raw_upper = raw_token.strip().upper()
+        token_clean = raw_token.strip(' "\',:\r\n{}').upper()
 
-        if "STATUS" in token_upper:
+        if "STATUS" in raw_upper:
             seen_status_keyword = True
-            # Case where token contains both header and value (e.g. "STATUS: CONFIRMED")
+            # Case where token contains both header/key and value (e.g. "STATUS: CONFIRMED" or '"status": "CONFIRMED"')
             for status in status_values:
-                if status in token_upper:
+                if status in raw_upper:
                     return item
             continue
 
         if seen_status_keyword:
-            if token_upper in {":", ""}:
+            if token_clean in {":", "", "NONE"}:
                 continue
-            if any(token_upper.startswith(p) for p in status_prefixes) or any(
-                s.startswith(token_upper) for s in status_values if len(token_upper) >= 3
+            if any(token_clean.startswith(p) for p in status_prefixes) or any(
+                s.startswith(token_clean) for s in status_values if len(token_clean) >= 3
             ):
                 return item
-            if token_upper in status_values:
+            if token_clean in status_values:
                 return item
-            if "ARRIVAL" in token_upper or "NOTES" in token_upper:
+            if "ARRIVAL" in raw_upper or "NOTES" in raw_upper:
                 break
 
     # Pass 2: Fallback scan across all tokens for direct status matches or prefixes
@@ -198,8 +222,8 @@ def _find_status_token_item(choice: Any) -> Optional[Any]:
             raw_token = item.get("token", "")
         if not raw_token:
             continue
-        token_upper = raw_token.strip().upper()
-        if token_upper in status_values or any(token_upper == p for p in status_prefixes):
+        token_clean = raw_token.strip(' "\',:\r\n{}').upper()
+        if token_clean in status_values or any(token_clean == p for p in status_prefixes):
             return item
 
     return None
@@ -253,11 +277,50 @@ def _extract_status_alternatives(choice: Any) -> List[Tuple[str, float]]:
         if t_str is not None and t_lp is not None:
             try:
                 prob = round(max(0.0, min(1.0, math.exp(float(t_lp)))), 4)
-                alternatives.append((t_str.strip(), prob))
+                clean_t = t_str.strip(' "\',:')
+                alternatives.append((clean_t, prob))
             except (ValueError, OverflowError):
                 continue
 
     return alternatives
+
+
+def _parse_pydantic_from_raw(raw_text: str) -> ReplyExtractionSchema:
+    """Parse raw text/JSON output into ReplyExtractionSchema with robust fallbacks."""
+    # Attempt 1: Parse as JSON
+    try:
+        json_text = raw_text
+        match = re.search(r"\{.*?\}", raw_text, re.DOTALL)
+        if match:
+            json_text = match.group(0)
+        data = json.loads(json_text)
+        return ReplyExtractionSchema.model_validate(data)
+    except Exception:
+        pass
+
+    # Attempt 2: Parse as 3-line format (STATUS: / ARRIVAL: / NOTES:)
+    status = "CONDITIONAL"
+    arrival_time: Optional[str] = None
+    notes = raw_text
+
+    for line in raw_text.splitlines():
+        clean_line = line.strip()
+        if clean_line.startswith("STATUS:"):
+            val = clean_line.replace("STATUS:", "").strip().upper()
+            if val in {"CONFIRMED", "DECLINED", "CONDITIONAL"}:
+                status = val
+        elif clean_line.startswith("ARRIVAL:"):
+            val = clean_line.replace("ARRIVAL:", "").strip()
+            if val.upper() != "NONE" and val:
+                arrival_time = val
+        elif clean_line.startswith("NOTES:"):
+            notes = clean_line.replace("NOTES:", "").strip()
+
+    return ReplyExtractionSchema(
+        status=status,  # type: ignore
+        arrival_time=arrival_time,
+        notes=notes or "תשובה התקבלה",
+    )
 
 
 def generate_outreach_message(
@@ -357,7 +420,7 @@ def confirm_arrival_dialogue(
     model: Optional[str] = None,
     usage_out: Optional[Dict[str, int]] = None,
 ) -> ExtractedConstraints:
-    """Send candidate reply to the LLM and extract structured schedule constraints.
+    """Send candidate reply to the LLM and extract structured schedule constraints via Pydantic schema.
 
     Prompt Caching Design:
         Static system instructions, classification rules, negative constraints, and
@@ -385,10 +448,10 @@ def confirm_arrival_dialogue(
 
     system_prompt = (
         "אתה עוזר לרכזת גני ילדים לניתוח תשובות וואטסאפ של סייעות מחליפות וחילוץ אילוצי שיבוץ.\n"
-        "עליך לנתח את תוכן ההודעה ששלחה הסייעת ולהחזיר פלט מובנה בפורמט המדויק הבא (3 שורות בלבד, ללא שום תוספת):\n"
-        "STATUS: CONFIRMED או DECLINED או CONDITIONAL\n"
-        "ARRIVAL: שעת הגעה בפורמט HH:MM אם ציינה איחור/הגעה חלקית, אחרת NONE\n"
-        "NOTES: משפט קצר ותמציתי בעברית של עד 10 מילים המסכם את תשובת הסייעת\n\n"
+        "עליך לנתח את תוכן ההודעה ששלחה הסייעת ולהחזיר פלט JSON מובנה הכולל את השדות:\n"
+        "- status: CONFIRMED או DECLINED או CONDITIONAL\n"
+        "- arrival_time: שעת הגעה בפורמט HH:MM אם ציינה איחור/הגעה חלקית, אחרת null\n"
+        "- notes: משפט קצר ותמציתי בעברית של עד 10 מילים המסכם את תשובת הסייעת\n\n"
         "כללי סיווג:\n"
         "- CONFIRMED: אישור הגעה מלא בזמן מתחילת המשמרת ללא שום תנאי או הסתייגות.\n"
         "- DECLINED: סירוב מפורש להגיע למשמרת (למשל מחלה, חוסר פניות, סירוב).\n"
@@ -407,10 +470,13 @@ def confirm_arrival_dialogue(
         "shift_hours": "08:00-14:00",
         "candidate_reply": "בטח, מגיעה ב-08:00 בדיוק",
     }
-    ex1_output = (
-        "STATUS: CONFIRMED\n"
-        "ARRIVAL: NONE\n"
-        "NOTES: הסייעת אישרה הגעה בזמן"
+    ex1_output = json.dumps(
+        {
+            "status": "CONFIRMED",
+            "arrival_time": None,
+            "notes": "הסייעת אישרה הגעה בזמן",
+        },
+        ensure_ascii=False,
     )
 
     # Few-shot 2: Enthusiastic reply with late arrival
@@ -421,10 +487,13 @@ def confirm_arrival_dialogue(
         "shift_hours": "08:00-14:00",
         "candidate_reply": "אשמח להגיע, רק אוכל להגיע ב-08:30",
     }
-    ex2_output = (
-        "STATUS: CONDITIONAL\n"
-        "ARRIVAL: 08:30\n"
-        "NOTES: הסייעת תשמח להגיע אך באיחור ל-08:30"
+    ex2_output = json.dumps(
+        {
+            "status": "CONDITIONAL",
+            "arrival_time": "08:30",
+            "notes": "הסייעת תשמח להגיע אך באיחור ל-08:30",
+        },
+        ensure_ascii=False,
     )
 
     # Few-shot 3: Clear decline
@@ -435,10 +504,13 @@ def confirm_arrival_dialogue(
         "shift_hours": "08:00-14:00",
         "candidate_reply": "סליחה, אני חולה היום ולא אוכל להגיע",
     }
-    ex3_output = (
-        "STATUS: DECLINED\n"
-        "ARRIVAL: NONE\n"
-        "NOTES: הסייעת חולה ולא תוכל להגיע למשמרת"
+    ex3_output = json.dumps(
+        {
+            "status": "DECLINED",
+            "arrival_time": None,
+            "notes": "הסייעת חולה ולא תוכל להגיע למשמרת",
+        },
+        ensure_ascii=False,
     )
 
     runtime_input = {
@@ -464,29 +536,114 @@ def confirm_arrival_dialogue(
     ]
 
     client = _get_llm_client()
-    response = client.chat.completions.create(
-        model=target_model,
-        messages=messages,
-        temperature=0.0,
-        seed=42,
-        max_tokens=80,
-        logprobs=True,
-        top_logprobs=3,
-    )
+    if not hasattr(client.chat.completions, "parse") and hasattr(client, "beta"):
+        try:
+            client.chat.completions.parse = client.beta.chat.completions.parse
+        except Exception:
+            pass
+
+    parsed_schema: Optional[ReplyExtractionSchema] = None
+    response = None
+
+    # Primary path: Constrained decoding via client.chat.completions.parse
+    try:
+        if not hasattr(client.chat.completions, "parse"):
+            raise AttributeError("Client has no 'parse' method on chat.completions")
+
+        response = client.chat.completions.parse(
+            model=target_model,
+            messages=messages,
+            response_format=ReplyExtractionSchema,
+            temperature=0.0,
+            seed=42,
+            max_tokens=80,
+            logprobs=True,
+            top_logprobs=3,
+        )
+        choice = response.choices[0]
+        parsed_schema = getattr(choice.message, "parsed", None)
+        if parsed_schema is None:
+            raw_text = _clean_model_output(getattr(choice.message, "content", "") or "")
+            parsed_schema = _parse_pydantic_from_raw(raw_text)
+    except Exception:
+        # Safe Local Fallback: use client.chat.completions.create for Ollama/runners without .parse support
+        response = client.chat.completions.create(
+            model=target_model,
+            messages=messages,
+            temperature=0.0,
+            seed=42,
+            max_tokens=80,
+            logprobs=True,
+            top_logprobs=3,
+        )
+        choice = response.choices[0]
+        raw_text = _clean_model_output(getattr(choice.message, "content", "") or "")
+        parsed_schema = _parse_pydantic_from_raw(raw_text)
 
     if usage_out is not None:
         usage_out.update(_extract_token_usage(response))
 
     choice = response.choices[0]
-    raw_output = _clean_model_output(choice.message.content)
     confidence = _extract_status_confidence(choice)
     top_alternatives = _extract_status_alternatives(choice)
 
-    return _parse_llm_constraints(
-        raw_output=raw_output,
+    willingness = parsed_schema.status if parsed_schema else "CONDITIONAL"
+    arrival_time = parsed_schema.arrival_time if parsed_schema else None
+    notes = parsed_schema.notes if parsed_schema else "תשובה התקבלה"
+
+    if confidence is not None and confidence < 0.85:
+        warning = "[דורש בדיקת רכזת - ביטחון סיווג נמוך]"
+        if warning not in notes:
+            notes = f"{notes} {warning}".strip()
+
+    raw_constraints = ExtractedConstraints(
+        willingness=willingness,
+        arrival_time=arrival_time,
+        notes=notes,
         confidence=confidence,
         top_alternatives=top_alternatives,
     )
+    return _enforce_deterministic_constraints(raw_constraints)
+
+
+def _enforce_deterministic_constraints(
+    constraints: ExtractedConstraints,
+) -> ExtractedConstraints:
+    """Apply deterministic guardrails and validation rules to extracted constraints.
+
+    1. Validates arrival_time against regex r"^(\d{1,2}):(\d{2})$":
+       - Normalizes single-digit hours (e.g. "8:30" -> "08:30").
+       - Resets invalid/non-time strings (or out-of-range times) to None.
+    2. Enforces deterministic business rule:
+       - If arrival_time is not None and willingness == "CONFIRMED",
+         automatically overrides willingness = "CONDITIONAL" so the model
+         cannot violate the late-arrival rule through instruction non-compliance.
+    """
+    if constraints is None:
+        return constraints
+
+    raw_time = constraints.arrival_time
+    normalized_time: Optional[str] = None
+
+    if raw_time is not None and isinstance(raw_time, str):
+        clean_time = raw_time.strip()
+        match = re.match(r"^(\d{1,2}):(\d{2})$", clean_time)
+        if match:
+            h_str, m_str = match.groups()
+            h, m = int(h_str), int(m_str)
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                normalized_time = f"{h:02d}:{m:02d}"
+            else:
+                normalized_time = None
+        else:
+            normalized_time = None
+
+    constraints.arrival_time = normalized_time
+
+    if constraints.arrival_time is not None and constraints.willingness == "CONFIRMED":
+        constraints.willingness = "CONDITIONAL"
+
+    return constraints
 
 
 def _parse_llm_constraints(
@@ -494,36 +651,101 @@ def _parse_llm_constraints(
     confidence: Optional[float] = None,
     top_alternatives: Optional[List[Tuple[str, float]]] = None,
 ) -> ExtractedConstraints:
-    """Parse the 3-line LLM output into an ExtractedConstraints object."""
-    willingness = "CONDITIONAL"
-    arrival_time: Optional[str] = None
-    notes = raw_output
-
-    for line in raw_output.splitlines():
-        clean_line = line.strip()
-        if clean_line.startswith("STATUS:"):
-            val = clean_line.replace("STATUS:", "").strip().upper()
-            if val in {"CONFIRMED", "DECLINED", "CONDITIONAL"}:
-                willingness = val
-        elif clean_line.startswith("ARRIVAL:"):
-            val = clean_line.replace("ARRIVAL:", "").strip()
-            if val.upper() != "NONE" and val:
-                arrival_time = val
-        elif clean_line.startswith("NOTES:"):
-            notes = clean_line.replace("NOTES:", "").strip()
+    """Parse raw LLM output into an ExtractedConstraints object using ReplyExtractionSchema."""
+    parsed_schema = _parse_pydantic_from_raw(raw_output)
+    notes = parsed_schema.notes
 
     if confidence is not None and confidence < 0.85:
         warning = "[דורש בדיקת רכזת - ביטחון סיווג נמוך]"
         if warning not in notes:
             notes = f"{notes} {warning}".strip()
 
-    return ExtractedConstraints(
-        willingness=willingness,
-        arrival_time=arrival_time,
+    raw_constraints = ExtractedConstraints(
+        willingness=parsed_schema.status,
+        arrival_time=parsed_schema.arrival_time,
         notes=notes,
         confidence=confidence,
         top_alternatives=top_alternatives,
     )
+    return _enforce_deterministic_constraints(raw_constraints)
+
+
+def continue_conversation(
+    context: DialogueContext,
+    candidate_message: str,
+    stub_mode: bool = False,
+    model: Optional[str] = None,
+    usage_out: Optional[Dict[str, int]] = None,
+) -> str:
+    """Generate a grounded conversational reply to candidate follow-up questions.
+
+    Anti-Hallucination Grounding Constraint:
+        Restricts replies strictly to known shift facts. When asked about missing
+        details (parking, pay, entry codes), instructs the agent to politely state
+        it will check with the coordinator.
+    """
+    if stub_mode:
+        if usage_out is not None:
+            usage_out.update({
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+            })
+        return (
+            f"היי {context.candidate_name}, המשמרת בגן '{context.garden_name}' "
+            f"היא בתאריך {context.shift_date} בשעות {context.shift_hours}. "
+            "לגבי שאלתך, אבדוק עם הרכזת ואחזור אלייך בהקדם."
+        )
+
+    target_model = _resolve_outreach_model(model)
+
+    grounding_constraint = (
+        "Answer ONLY using facts explicitly provided in the shift context. "
+        "Never invent or guess missing details (such as parking, pay rates, or gate codes). "
+        "If the substitute asks about something not in the context, politely state in Hebrew "
+        "that you will check with the coordinator and get back to her."
+    )
+
+    system_prompt = (
+        "אתה עוזר לרכזת גני ילדים המנהל שיחת וואטסאפ עם סייעת מחליפה.\n"
+        "פרטי המשמרת המאושרים:\n"
+        f"- שם הסייעת: {context.candidate_name}\n"
+        f"- גן: {context.garden_name}\n"
+        f"- תאריך: {context.shift_date}\n"
+        f"- שעות משמרת: {context.shift_hours}\n\n"
+        "הנחיית מניעת הזיות ודיוק עובדתי (Grounding Constraint):\n"
+        f"{grounding_constraint}\n\n"
+        "כללי שיחה:\n"
+        "- כתוב הודעת וואטסאפ קצרה, חמה ומקצועית בעברית.\n"
+        "- ענה בצורה עניינית לשאלת הסייעת.\n"
+        "- פלוט אך ורק את נוסח ההודעה ללא הקדמות או מרכאות."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    history = getattr(context, "chat_history", None) or getattr(context, "history", None) or []
+    for turn in history:
+        role = turn.get("role", "user")
+        content = turn.get("content", "")
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+
+    messages.append({
+        "role": "user",
+        "content": f"{candidate_message}\n/no_think",
+    })
+
+    client = _get_llm_client()
+    response = client.chat.completions.create(
+        model=target_model,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=150,
+    )
+    if usage_out is not None:
+        usage_out.update(_extract_token_usage(response))
+    return _clean_model_output(response.choices[0].message.content)
 
 
 class DialogueAgent:
@@ -617,6 +839,21 @@ class DialogueAgent:
         self._record_call_usage(call_usage)
         return constraints
 
+    def continue_conversation(
+        self, context: DialogueContext, candidate_message: str
+    ) -> str:
+        """Continue multi-turn conversation with anti-hallucination grounding and track usage."""
+        call_usage: Dict[str, int] = {}
+        reply = continue_conversation(
+            context=context,
+            candidate_message=candidate_message,
+            stub_mode=self.stub_mode,
+            model=self.outreach_model,
+            usage_out=call_usage,
+        )
+        self._record_call_usage(call_usage)
+        return reply
+
 
 if __name__ == "__main__":
     sample_candidate = CandidateMatch(
@@ -657,7 +894,7 @@ if __name__ == "__main__":
         print(opening)
 
     print("\n==================================================")
-    print("2. ניתוח תשובה עמומה (temperature=0.0, seed=42, max_tokens=80, logprobs=True)")
+    print("2. ניתוח תשובה עמומה (Pydantic ReplyExtractionSchema, logprobs=True)")
     print("==================================================")
     ctx = DialogueContext(
         candidate_name="חן כהן",
