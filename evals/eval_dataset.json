@@ -1,0 +1,140 @@
+{
+  "version": "1.0",
+  "description": "Evaluation dataset for kindergarten substitute teacher WhatsApp agent (Module 3 Part H)",
+  "classification_cases": [
+    {
+      "id": "eval_01",
+      "category": "common",
+      "candidate_reply": "היי, כן בוודאי, אני פנויה מחר ואגיע בזמן",
+      "expected_status": "CONFIRMED",
+      "expected_arrival_time": null,
+      "notes": "Standard clear confirmation in Hebrew"
+    },
+    {
+      "id": "eval_02",
+      "category": "common",
+      "candidate_reply": "לצערי אני תפוסה מחר בגן אחר, פעם הבאה בשמחה",
+      "expected_status": "DECLINED",
+      "expected_arrival_time": null,
+      "notes": "Standard polite refusal"
+    },
+    {
+      "id": "eval_03",
+      "category": "common",
+      "candidate_reply": "מאושר, נתראה בבוקר",
+      "expected_status": "CONFIRMED",
+      "expected_arrival_time": null,
+      "notes": "Short direct confirmation"
+    },
+    {
+      "id": "eval_04",
+      "category": "hard",
+      "candidate_reply": "אני יכולה להגיע אבל צריכה לצאת חצי שעה מוקדם יותר לאסוף את הילד",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": null,
+      "notes": "Early departure constraint without late arrival time"
+    },
+    {
+      "id": "eval_05",
+      "category": "hard",
+      "candidate_reply": "אם זה הגן ברחוב הרצל אז מתאים לי, אם זה השכונה השנייה לא אוכל",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": null,
+      "notes": "Location-dependent conditional availability"
+    },
+    {
+      "id": "eval_06",
+      "category": "hard",
+      "candidate_reply": "יכולה להחליף רק מ-09:15 אחרי תור לרופא",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": "09:15",
+      "notes": "Late arrival due to appointment"
+    },
+    {
+      "id": "eval_07",
+      "category": "misleading",
+      "candidate_reply": "איזה כיף! ברור שאבוא, רק שמה את הקטן במסגרת ב-08:15 ומגיעה מיד",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": "08:15",
+      "notes": "Enthusiastic tone masking a late arrival (tests alignment bias guard)"
+    },
+    {
+      "id": "eval_08",
+      "category": "misleading",
+      "candidate_reply": "וואו ממש רציתי לעזור לכן, הלוואי שיכולתי מחר אבל אני מחוץ לעיר",
+      "expected_status": "DECLINED",
+      "expected_arrival_time": null,
+      "notes": "Warm apologetic tone that is actually a refusal"
+    },
+    {
+      "id": "eval_09",
+      "category": "misleading",
+      "candidate_reply": "סגור לגמרי, מקווה שהאוטובוס לא יאחר ואגיע ב-08:30 במקום שמונה",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": "08:30",
+      "notes": "Starts with 'סגור לגמרי' but specifies 08:30 arrival instead of 08:00"
+    },
+    {
+      "id": "eval_10",
+      "category": "varied_style",
+      "candidate_reply": "סבבה אחותי אני באה",
+      "expected_status": "CONFIRMED",
+      "expected_arrival_time": null,
+      "notes": "Informal Hebrew slang confirmation"
+    },
+    {
+      "id": "eval_11",
+      "category": "varied_style",
+      "candidate_reply": "היי בוקר טוב אני כרגע בנהיגה אז מקליטה בקול אני אוכל להגיע מחר רק בתשע בבוקר כי יש לי סידור על הבוקר תעדכני אם זה טוב",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": "09:00",
+      "notes": "Voice-to-text run-on sentence without punctuation and written Hebrew hour"
+    },
+    {
+      "id": "eval_12",
+      "category": "edge",
+      "candidate_reply": "👍",
+      "expected_status": "CONFIRMED",
+      "expected_arrival_time": null,
+      "notes": "Emoji-only confirmation"
+    },
+    {
+      "id": "eval_13",
+      "category": "edge",
+      "candidate_reply": "לא רלוונטי",
+      "expected_status": "DECLINED",
+      "expected_arrival_time": null,
+      "notes": "Terse two-word refusal"
+    },
+    {
+      "id": "eval_14",
+      "category": "regression",
+      "candidate_reply": "מגיעה בשמחה ב-8:45",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": "08:45",
+      "notes": "Regression guard: single-digit hour normalization + late arrival override"
+    },
+    {
+      "id": "eval_15",
+      "category": "regression",
+      "candidate_reply": "אולי, אבדוק עם בעלי ואחזיר תשובה בערב",
+      "expected_status": "CONDITIONAL",
+      "expected_arrival_time": null,
+      "notes": "Regression guard: uncertain reply must not be classified as CONFIRMED"
+    }
+  ],
+  "free_text_cases": [
+    {
+      "id": "ft_01",
+      "description": "Outreach message must include garden name and hours without inventing perks",
+      "required_terms": ["גן שקד", "08:00"],
+      "forbidden_terms": ["חניון חינם", "בונוס", "קוד שער"]
+    },
+    {
+      "id": "ft_02",
+      "description": "Unknown logistics question must defer to coordinator without hallucinating",
+      "required_terms": ["רכזת"],
+      "forbidden_terms": ["כחול לבן", "חניון תת קרקעי"]
+    }
+  ]
+}
